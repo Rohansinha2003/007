@@ -140,6 +140,33 @@ MIGRATIONS: list[str] = [
         created_at TEXT NOT NULL
     );
     """,
+    # 5: market demand from job postings
+    """
+    CREATE TABLE postings (
+        id           INTEGER PRIMARY KEY,
+        role         TEXT NOT NULL,      -- label you give with --role, lowercased
+        title        TEXT,
+        company      TEXT,
+        location     TEXT,
+        description  TEXT NOT NULL,      -- redacted
+        source       TEXT,               -- file path, file:row, or 'paste'
+        content_hash TEXT NOT NULL,      -- sha256 of the normalized description
+        extractor    TEXT,               -- llm | keywords | NULL until extracted
+        rejected     TEXT NOT NULL DEFAULT '[]',  -- extracted skills whose quote is not in the posting
+        extracted_at TEXT,
+        added_at     TEXT NOT NULL,
+        UNIQUE (role, content_hash)
+    );
+    CREATE INDEX postings_role ON postings(role);
+    CREATE TABLE posting_skills (
+        posting_id  INTEGER NOT NULL REFERENCES postings(id) ON DELETE CASCADE,
+        skill       TEXT NOT NULL,       -- canonical name (skills.canonical)
+        skill_key   TEXT NOT NULL,       -- skills.key(skill), joins with skills_observed
+        requirement TEXT NOT NULL,       -- required | preferred
+        quote       TEXT NOT NULL,       -- words from the posting that show it
+        PRIMARY KEY (posting_id, skill_key)
+    );
+    """,
 ]
 
 

@@ -10,6 +10,7 @@ projects:
     evidence: 0.20      # how much verifiable evidence exists
     shipped: 0.20       # deployed or released
     recency: 0.15       # last activity
+    demand: 0.25        # market demand for the target role (ignored when no postings are on file)
   thresholds:
     keep: 0.55
     rewrite: 0.40
@@ -38,6 +39,7 @@ skills:
     depth: 0.25         # how heavily it is used where it appears
     recency: 0.20
     evidence: 0.20      # number of evidence rows
+    demand: 0.25        # demand score for the target role (ignored when no postings are on file)
   thresholds:
     keep: 0.50
     rewrite: 0.30
@@ -47,3 +49,10 @@ skills:
   recency_half_life_days: 365
   min_depth_for_keep: 0.05     # a skill that is a trace everywhere it appears is capped at "rewrite"
   needs_evidence_min_claims: 2   # a skill claimed this often without evidence is "needs_evidence", else "drop"
+
+# Market demand (from `resume market add`). Used by the demand criterion above.
+market:
+  required_weight: 1.0       # a posting that requires a skill counts this much
+  preferred_weight: 0.5      # a posting that lists it as nice-to-have counts this much
+  project_top_k: 3           # project demand = demand of its top k skills / demand of the role's top k skills
+  min_language_share: 0.05   # languages below this share of a project's code do not count toward its demand

@@ -55,20 +55,20 @@ def test_band_edges():
 def test_project_score_is_weighted_sum():
     p = pinput(outcome="shipped", authorship="ai_assisted")
     r = ev.score_project(p, J, RUBRIC, NOW)
-    w = RUBRIC["projects"]["weights"]
+    w = ev.active_weights(RUBRIC["projects"]["weights"], use_demand=False)  # no postings -> demand left out
     ev_cfg = RUBRIC["projects"]["evidence"]
     expected_evidence = ev_cfg["volume_weight"] * ev.saturating(1, ev_cfg["saturation"]) + \
         (1 - ev_cfg["volume_weight"]) * 1 / len(ev_cfg["kinds"])
     expected = (w["depth"] * 0.75 + w["originality"] * 0.7 + w["evidence"] * expected_evidence
                 + w["shipped"] * 1.0 + w["recency"] * 1.0)
     assert r.score == pytest.approx(expected, abs=1e-3)
-    assert sum(r.breakdown[c]["points"] for c in ev.PROJECT_CRITERIA) == pytest.approx(r.score, abs=2e-3)
+    assert sum(r.breakdown[c]["points"] for c in w) == pytest.approx(r.score, abs=2e-3) and "demand" not in r.breakdown
     assert r.breakdown["inputs"]["outcome_source"] == "extraction"
 
 
 def test_weights_are_normalized_and_configurable(tmp_path):
     raw = yaml.safe_load(ev.DEFAULT_RUBRIC.read_text())
-    raw["projects"]["weights"] = {"depth": 2, "originality": 0, "evidence": 0, "shipped": 0, "recency": 0}
+    raw["projects"]["weights"] = {"depth": 2, "originality": 0, "evidence": 0, "shipped": 0, "recency": 0, "demand": 0}
     path = tmp_path / "r.yaml"
     path.write_text(yaml.safe_dump(raw))
     rb = ev.load_rubric(path)
@@ -79,7 +79,7 @@ def test_weights_are_normalized_and_configurable(tmp_path):
 
 @pytest.mark.parametrize("patch,msg", [
     ({"weights": {"depth": 1}}, "missing"),
-    ({"weights": {"depth": -1, "originality": 1, "evidence": 1, "shipped": 1, "recency": 1}}, "non-negative"),
+    ({"weights": {"depth": -1, "originality": 1, "evidence": 1, "shipped": 1, "recency": 1, "demand": 1}}, "non-negative"),
     ({"thresholds": {"keep": 0.3, "rewrite": 0.5}}, "thresholds"),
 ])
 def test_bad_rubric_rejected(tmp_path, patch, msg):

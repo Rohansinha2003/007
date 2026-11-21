@@ -1,0 +1,95 @@
+title,company,location,description
+AI Engineer,Fictional Labs,Remote (US),"We are building LLM-powered tools for support teams.
+
+Responsibilities:
+- Ship RAG features end to end, from embeddings to the UI
+- Own evals for prompt changes
+
+Requirements:
+- 3+ years of Python
+- Experience with LLM APIs (OpenAI API or Anthropic API) and prompt engineering
+- Built a RAG system with a vector database
+- SQL and PostgreSQL
+
+Nice to have:
+- Docker
+- AWS
+- TypeScript"
+Machine Learning Engineer,Example Robotics Co,"Austin, TX","Requirements:
+- Python, PyTorch
+- Deep learning for computer vision
+- Docker and Linux
+
+Preferred:
+- Kubernetes
+- MLflow
+- C++"
+Applied AI Engineer,Placeholder Health,"New York, NY","You will design AI agents that help clinicians.
+
+What you'll need:
+- Python and FastAPI
+- LLM APIs and RAG
+- PostgreSQL
+- Testing with pytest
+
+Bonus:
+- LangChain
+- Hugging Face"
+LLM Engineer,Sample Fintech,Remote,"Requirements:
+- Python
+- Fine-tuning LLMs (LoRA, PEFT)
+- Hugging Face transformers
+- PyTorch
+
+Nice to have:
+- AWS
+- Docker
+- Spark"
+AI Product Engineer,Demo Commerce,"San Francisco, CA","Requirements:
+- TypeScript and React
+- Node.js
+- Python
+- LLM APIs
+
+Experience with Next.js is a plus.
+Familiarity with PostgreSQL is a plus."
+"Data Scientist, ML",Mock Analytics,"Chicago, IL","We want someone who loves data. Python, SQL, pandas and scikit-learn every day.
+You will build machine learning models and dashboards in Tableau. Statistics background needed."
+Generative AI Engineer,Imaginary Media,Remote (EU),"Requirements:
+- Python
+- RAG and embeddings
+- Vector databases (pgvector or Pinecone)
+- Docker
+- REST APIs
+
+Nice to have:
+- Kubernetes
+- Google Cloud"
+Junior AI Engineer,Test Startup Inc,"Boston, MA","Requirements:
+- Python
+- Git
+- Machine learning fundamentals
+- LLM APIs
+
+Preferred:
+- FastAPI
+- React"
+AI Platform Engineer,Sandbox Cloud,"Seattle, WA","Requirements:
+- Python and Go
+- Kubernetes and Docker
+- AWS
+- CI/CD with GitHub Actions
+
+Nice to have:
+- Terraform
+- MLOps"
+"AI Engineer, Agents",Hypothetical AI,Remote,"Requirements:
+- Python
+- AI agents and tool use with LLM APIs
+- Prompt engineering
+- LLM evaluation
+
+Nice to have:
+- TypeScript
+- Redis
+- RAG"

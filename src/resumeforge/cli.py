@@ -7,14 +7,18 @@ from pathlib import Path
 
 import typer
 
-from . import db, evaluator as ev, extract as ex, llm as llm_mod
-from .skills import key as skill_key
+import sys
+
+from . import db, evaluator as ev, extract as ex, llm as llm_mod, market as mk
+from .skills import canonical, key as skill_key
 from .ingest import antigravity, claude_code, codex, common, exports, github
 
 app = typer.Typer(add_completion=False, no_args_is_help=True,
                   help="Evidence-based resume builder. No evidence, no claim.")
 ingest_app = typer.Typer(no_args_is_help=True, help="Import work history into the database.")
 app.add_typer(ingest_app, name="ingest")
+market_app = typer.Typer(no_args_is_help=True, help="Job postings you collect, and the skill demand they show.")
+app.add_typer(market_app, name="market")
 
 DB_PATH = Path(os.environ.get("RESUME_DB", "resume.db"))
 
@@ -195,7 +199,8 @@ def skills(
                         + (" WHERE kind=?" if kind else ""), (kind,) if kind else ()).fetchall()
     groups: dict[str, dict] = {}
     for r in rows:
-        g = groups.setdefault(skill_key(r["skill"]), {"skill": r["skill"], "projects": set(), "evidence": set(),
+        name = canonical(r["skill"])
+        g = groups.setdefault(skill_key(name), {"skill": name, "projects": set(), "evidence": set(),
                                                       "kinds": set(), "origins": set()})
         g["projects"].add(r["project_id"])
         g["evidence"].add(r["evidence_id"])
@@ -217,6 +222,16 @@ def skills(
     typer.echo(f"{len(out)} skill(s)")
 
 
+def _cells(b: dict, criteria) -> str:
+    return " ".join(f"{b[c]['value']:>4.2f}" if c in b else f"{'-':>4}" for c in criteria)
+
+
+def _saved_role(conn) -> str | None:
+    """The role used last time, if postings for it still exist."""
+    r = db.get_setting(conn, "target_role")
+    return r if r and conn.execute("SELECT 1 FROM postings WHERE role=? LIMIT 1", (r,)).fetchone() else None
+
+
 DECISION_MARK = {"keep": "KEEP", "rewrite": "REWRITE", "drop": "drop", "needs_evidence": "NEEDS EVIDENCE"}
 
 
@@ -234,9 +249,17 @@ def evaluate(
     show: str = typer.Option("all", help="all, projects or skills"),
     as_json: bool = typer.Option(False, "--json"),
     width: int = typer.Option(70, help="Reason column width"),
+    role: str = typer.Option(None, help="Target role for the demand criterion (default: last used, or the only role)"),
 ):
     """Score projects and skills with the rubric and print keep / rewrite / drop decisions."""
     conn = db.connect(ctx.obj["db"])
+    try:
+        role = mk.resolve_role(conn, role or _saved_role(conn))
+    except mk.MarketError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1)
+    if role is None:
+        typer.echo("No job postings: scoring without the demand criterion (see `resume market add`).", err=True)
     try:
         rb = ev.load_rubric(rubric)
     except (ev.RubricError, KeyError, OSError) as e:
@@ -257,7 +280,10 @@ def evaluate(
     if not conn.execute("SELECT 1 FROM projects LIMIT 1").fetchone():
         typer.echo("No projects. Run: resume ingest github <username>")
         raise typer.Exit(1)
-    ev.evaluate(conn, j, rb)
+    ev.evaluate(conn, j, rb, role=role)
+    if role:
+        db.set_setting(conn, "target_role", role)
+        conn.commit()
     overrides = ev.get_overrides(conn)
     rows = conn.execute("SELECT * FROM evaluations ORDER BY item_type, score DESC").fetchall()
     if as_json:
@@ -268,25 +294,26 @@ def evaluate(
         typer.echo(json.dumps(out, indent=2))
         return
     if show in ("all", "projects"):
-        typer.echo(f"PROJECTS  (rubric {rb['hash']}, judge {judge}; * = your override)")
-        typer.echo(f"{'id':<5} {'project':<28} {'score':>5}  {'dep':>4} {'orig':>4} {'evid':>4} {'ship':>4} {'rec':>4}  "
-                   f"{'decision':<9} reason")
+        typer.echo(f"PROJECTS  (rubric {rb['hash']}, judge {judge}, role {role or 'none'}; * = your override)")
+        typer.echo(f"{'id':<5} {'project':<28} {'score':>5}  {'dep':>4} {'orig':>4} {'evid':>4} {'ship':>4} {'rec':>4} "
+                   f"{'dem':>4}  {'decision':<9} reason")
         for r in rows:
             if r["item_type"] != "project":
                 continue
             b = json.loads(r["breakdown"])
             d, _ = _row_decision(r, overrides)
-            cells = " ".join(f"{b[c]['value']:>4.2f}" for c in ev.PROJECT_CRITERIA)
+            cells = _cells(b, ev.PROJECT_CRITERIA)
             typer.echo(f"{r['item_id']:<5} {r['name'][:28]:<28} {r['score']:>5.2f}  {cells}  {d:<9} {r['reason'][:width]}")
     if show in ("all", "skills"):
         typer.echo(f"\nSKILLS")
-        typer.echo(f"{'id':<22} {'skill':<20} {'score':>5}  {'brd':>4} {'dep':>4} {'rec':>4} {'evid':>4}  {'decision':<9} reason")
+        typer.echo(f"{'id':<22} {'skill':<20} {'score':>5}  {'brd':>4} {'dep':>4} {'rec':>4} {'evid':>4} {'dem':>4}  "
+                   f"{'decision':<9} reason")
         for r in rows:
             if r["item_type"] != "skill":
                 continue
             b = json.loads(r["breakdown"])
             d, note = _row_decision(r, overrides)
-            cells = " ".join(f"{b[c]['value']:>4.2f}" for c in ev.SKILL_CRITERIA)
+            cells = _cells(b, ev.SKILL_CRITERIA)
             reason = r["reason"] + (f" ({note})" if note and note != "override" else "")
             typer.echo(f"{r['item_id'][:22]:<22} {r['name'][:20]:<20} {r['score']:>5.2f}  {cells}  {d:<9} {reason[:width]}")
     counts = {}
@@ -357,6 +384,173 @@ def llm_usage(ctx: typer.Context):
     for r in rows:
         typer.echo(f"{r['purpose'] or '-':<18} {r['model']:<18} calls {r['calls']:>4}  cached {r['cached']:>4}  "
                    f"failed {r['failed']:>3}  in {r['i']:>8}  out {r['o']:>7}  ${r['c'] or 0:.4f}")
+
+
+def _posting_extractor(conn, name: str):
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+    if name == "llm" and not has_key:
+        typer.echo("error: --extractor llm needs ANTHROPIC_API_KEY", err=True)
+        raise typer.Exit(1)
+    if name == "auto":
+        name = "llm" if has_key else "keywords"
+        if not has_key:
+            typer.echo("No ANTHROPIC_API_KEY: skills are extracted by keyword matching on the alias table.", err=True)
+    if name not in ("llm", "keywords"):
+        typer.echo("error: --extractor must be auto, llm or keywords", err=True)
+        raise typer.Exit(1)
+    return mk.LLMExtractor(llm_mod.LLM(conn)) if name == "llm" else mk.KeywordExtractor()
+
+
+def _print_extracted(p, clean, rejected, used):
+    req = [c["skill"] for c in clean if c["requirement"] == "required"]
+    pref = [c["skill"] for c in clean if c["requirement"] == "preferred"]
+    typer.echo(f"  #{p['id']} {(p['title'] or '')[:40]:<40} required {len(req):>2}, preferred {len(pref):>2}"
+               + (f", rejected {len(rejected)}" if rejected else "") + (f"  [{used}]" if used not in ("llm", "keywords") else ""))
+
+
+@market_app.command("add")
+def market_add(
+    ctx: typer.Context,
+    source: str = typer.Argument(..., help="A .txt/.md/.csv file, a folder of them, '-' to paste on stdin, or the text itself"),
+    role: str = typer.Option(..., "--role", help="Role label for these postings, e.g. 'ai engineer'"),
+    extractor: str = typer.Option("auto", help="Skill extractor: auto, llm or keywords"),
+    no_extract: bool = typer.Option(False, "--no-extract", help="Store only; extract later with `resume market extract`"),
+):
+    """Add job postings under a role label. CSV columns: title, company, location, description."""
+    conn = db.connect(ctx.obj["db"])
+    x = None if no_extract else _posting_extractor(conn, extractor)  # fail before storing anything
+    try:
+        postings, skipped = mk.read_inputs(source, sys.stdin.read() if source == "-" else None)
+        added, dupes = mk.add_postings(conn, role, postings)
+    except mk.MarketError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1)
+    for s_ in skipped:
+        typer.echo(f"  skipped: {s_}", err=True)
+    r = mk.norm_role(role)
+    typer.echo(f"{r}: {len(added)} added, {dupes} already stored")
+    if added and not no_extract:
+        stats = mk.extract_postings(conn, x, r, on_posting=_print_extracted)
+        typer.echo(json.dumps(stats))
+
+
+@market_app.command("extract")
+def market_extract(
+    ctx: typer.Context,
+    role: str = typer.Option(None, help="Only this role"),
+    extractor: str = typer.Option("auto", help="auto, llm or keywords"),
+    force: bool = typer.Option(False, "--force", help="Re-extract postings already done"),
+):
+    """Extract required and preferred skills from stored postings."""
+    conn = db.connect(ctx.obj["db"])
+    stats = mk.extract_postings(conn, _posting_extractor(conn, extractor), role, force=force, on_posting=_print_extracted)
+    typer.echo(json.dumps(stats))
+
+
+@market_app.command("list")
+def market_list(ctx: typer.Context, role: str = typer.Option(None, help="Show this role's postings")):
+    """Roles with posting counts, or one role's postings."""
+    conn = db.connect(ctx.obj["db"])
+    if not role:
+        rows = mk.roles(conn)
+        if not rows:
+            typer.echo("No postings. Run: resume market add <file> --role <name>")
+            return
+        for r in rows:
+            typer.echo(f"{r['role']:<30} {r['postings']:>4} postings  {r['extracted']:>4} extracted  {r['extractors'] or '-'}")
+        return
+    for p in conn.execute("""SELECT p.id, p.title, p.company, p.location, p.extractor, COUNT(ps.skill_key) n
+                             FROM postings p LEFT JOIN posting_skills ps ON ps.posting_id = p.id
+                             WHERE p.role=? GROUP BY p.id ORDER BY p.id""", (mk.norm_role(role),)):
+        typer.echo(f"#{p['id']:<4} {(p['title'] or '-')[:36]:<36} {(p['company'] or '-')[:20]:<20} "
+                   f"{(p['location'] or '-')[:16]:<16} {p['n']:>3} skills  {p['extractor'] or 'not extracted'}")
+
+
+@market_app.command("remove")
+def market_remove(ctx: typer.Context, posting_id: int = typer.Argument(None), role: str = typer.Option(None, help="Remove every posting for this role")):
+    """Remove one posting by id, or all postings for a role."""
+    conn = db.connect(ctx.obj["db"])
+    if posting_id is None and not role:
+        typer.echo("error: give a posting id or --role", err=True)
+        raise typer.Exit(1)
+    cur = (conn.execute("DELETE FROM postings WHERE id=?", (posting_id,)) if posting_id is not None
+           else conn.execute("DELETE FROM postings WHERE role=?", (mk.norm_role(role),)))
+    conn.commit()
+    typer.echo(f"removed {cur.rowcount} posting(s)")
+
+
+@market_app.command("demand")
+def market_demand(
+    ctx: typer.Context,
+    role: str = typer.Option(None, help="Role (default: the only role on file)"),
+    top: int = typer.Option(40, help="Rows to show"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Demand per skill for a role: share of postings, required vs nice-to-have."""
+    conn = db.connect(ctx.obj["db"])
+    r = _role_or_exit(conn, role)
+    dem = mk.demand(conn, r, ev.load_rubric()["market"])
+    if as_json:
+        typer.echo(json.dumps([d.as_dict() for d in dem.values()], indent=2))
+        return
+    total = next(iter(dem.values())).total if dem else 0
+    typer.echo(f"DEMAND  role {r}  ({total} postings)")
+    typer.echo(f"{'skill':<24} {'postings':>8} {'freq':>5} {'req':>4} {'pref':>4}  {'flag':<12} {'demand':>6}")
+    for d in list(dem.values())[:top]:
+        typer.echo(f"{d.skill[:24]:<24} {d.postings:>8} {d.frequency:>5.0%} {d.required:>4} {d.preferred:>4}  "
+                   f"{d.flag:<12} {d.score:>6.2f}")
+
+
+def _role_or_exit(conn, role):
+    try:
+        r = mk.resolve_role(conn, role)
+    except mk.MarketError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1)
+    if r is None:
+        typer.echo("error: no postings. Run: resume market add <file> --role <name>", err=True)
+        raise typer.Exit(1)
+    return r
+
+
+@app.command()
+def gap(
+    ctx: typer.Context,
+    role: str = typer.Option(None, help="Role (default: the only role on file)"),
+    top: int = typer.Option(25, help="Rows per section"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Compare your evidenced skills with a role's demand."""
+    conn = db.connect(ctx.obj["db"])
+    r = _role_or_exit(conn, role)
+    g = mk.gap(conn, r, ev.load_rubric()["market"])
+    if as_json:
+        typer.echo(json.dumps(g, indent=2))
+        return
+    pending = g["postings"] - (g["extracted"] or 0)
+    typer.echo(f"GAP REPORT  role {g['role']}  ({g['postings']} postings, extractor {g['extractors'] or '-'})"
+               + (f"  [{pending} not extracted: run `resume market extract`]" if pending else ""))
+    typer.echo(f"Your evidence covers {g['coverage']:.0%} of this role's demand.\n")
+    def demand_cells(x):
+        return (f"  {x['skill'][:24]:<24} {str(x['postings']) + '/' + str(x['total']):>8} {x['frequency']:>5.0%} "
+                f"{x['required']:>4} {x['preferred']:>4}  {x['flag']:<12} {x['score']:>6.2f}")
+
+    hdr = f"  {'skill':<24} {'postings':>8} {'freq':>5} {'req':>4} {'pref':>4}  {'flag':<12} {'demand':>6}"
+    typer.echo(f"(a) In demand, and you have evidence  ({len(g['have'])})")
+    typer.echo(hdr + f"  {'projects':>8} {'evidence':>8}  evaluation")
+    for x in g["have"][:top]:
+        typer.echo(demand_cells(x) + f"  {x['projects']:>8} {x['evidence']:>8}  {x['evaluation'] or '-'}")
+    typer.echo(f"\n(b) In demand, no evidence yet  ({len(g['missing'])})")
+    typer.echo(hdr + "  note")
+    for x in g["missing"][:top]:
+        typer.echo(demand_cells(x) + f"  {x['note']}")
+    if len(g["missing"]) > top:
+        typer.echo(f"  ... {len(g['missing']) - top} more (--top)")
+    typer.echo(f"\n(c) You have evidence, no posting asks for it  ({len(g['unused'])})")
+    typer.echo(f"  {'skill':<24} {'projects':>8} {'evidence':>8}  {'kind':<20} evaluation")
+    for x in g["unused"][:top]:
+        typer.echo(f"  {x['skill'][:24]:<24} {x['projects']:>8} {x['evidence']:>8}  {','.join(x['kinds'])[:20]:<20} "
+                   f"{x['evaluation'] or '-'}")
 
 
 @app.command()

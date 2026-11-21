@@ -5,6 +5,8 @@ Pipeline per project:
   2. a Judge rates depth and complexity (1-5) with a one-line reason and evidence ids
   3. score_project() combines all criteria with the rubric weights -> score, breakdown, decision
 Skills are scored entirely in code (score_skill).
+With job postings on file for the target role, both get a "demand" criterion from market.demand();
+without postings that criterion is left out and the other weights are rescaled.
 
 To plug in a local model later, implement the Judge protocol (a `name` and a `judge()` method that
 returns a Judgment) and pass it to evaluate(). Nothing else changes.
@@ -23,13 +25,13 @@ from typing import Literal, Protocol
 import yaml
 from pydantic import BaseModel, Field
 
-from . import db
+from . import db, market
 from .llm import LLM, LLMError
 from .skills import canonical, key as skill_key
 
 DEFAULT_RUBRIC = Path(__file__).with_name("rubric.yaml")
-PROJECT_CRITERIA = ("depth", "originality", "evidence", "shipped", "recency")
-SKILL_CRITERIA = ("breadth", "depth", "recency", "evidence")
+PROJECT_CRITERIA = ("depth", "originality", "evidence", "shipped", "recency", "demand")
+SKILL_CRITERIA = ("breadth", "depth", "recency", "evidence", "demand")
 DECISIONS = ("keep", "rewrite", "drop", "needs_evidence")
 
 
@@ -54,6 +56,7 @@ def load_rubric(path: str | Path | None = None) -> dict:
         t = r[group]["thresholds"]
         if not 0 <= t["rewrite"] <= t["keep"] <= 1:
             raise RubricError(f"{group}.thresholds need 0 <= rewrite <= keep <= 1")
+    r["market"] = {**market.DEFAULT_WEIGHTS, "project_top_k": 3, "min_language_share": 0.05, **(r.get("market") or {})}
     r["hash"] = hashlib.sha256(raw.encode()).hexdigest()[:12]
     return r
 
@@ -93,6 +96,24 @@ def band(score: float, thresholds: dict) -> str:
     return "drop"
 
 
+def active_weights(weights: dict[str, float], use_demand: bool) -> dict[str, float]:
+    """Weights to apply: all of them, or without demand (rescaled to sum to 1) when there is no market data."""
+    if use_demand:
+        return weights
+    rest = {c: w for c, w in weights.items() if c != "demand"}
+    total = sum(rest.values())
+    return {c: w / total for c, w in rest.items()} if total else rest
+
+
+def project_demand(skills: dict[str, str], dem: dict, top_k: int) -> tuple[float, list[str]]:
+    """Share of the role's top-k demand that the project's top-k skills cover, in [0, 1]."""
+    mine = sorted(((dem[k].score, dem[k].skill) for k in skills if k in dem), reverse=True)[:top_k]
+    best = sum(sorted((d.score for d in dem.values()), reverse=True)[:top_k])
+    if not best:
+        return 0.0, []
+    return min(1.0, sum(v for v, _ in mine) / best), [n for v, n in mine if v > 0]
+
+
 def combine(values: dict[str, float], weights: dict[str, float]) -> tuple[float, dict]:
     breakdown = {c: {"value": round(values[c], 3), "weight": round(weights[c], 3),
                      "points": round(values[c] * weights[c], 3)} for c in weights}
@@ -126,6 +147,7 @@ class ProjectInput:
     files_edited: int
     readme: str
     evidence: list[dict] = field(default_factory=list)   # {id, kind, text}
+    skills: dict[str, str] = field(default_factory=dict)  # skill key -> name, for market demand
 
     @property
     def evidence_ids(self) -> set[int]:
@@ -193,7 +215,7 @@ Do not reward length of text or ambition stated in plans; reward what was built.
 
 # ---------- inputs ----------
 
-def project_inputs(conn, project_id: int) -> ProjectInput:
+def project_inputs(conn, project_id: int, min_language_share: float = 0.0) -> ProjectInput:
     p = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
     f = conn.execute("SELECT * FROM project_facts WHERE project_id=?", (project_id,)).fetchone()
     sess = conn.execute("""SELECT COUNT(*) n, COALESCE(SUM(user_message_count), 0) um, MAX(ended_at) last
@@ -213,13 +235,22 @@ def project_inputs(conn, project_id: int) -> ProjectInput:
         elif r["kind"] in ("assistant_summary", "assistant_message") and summaries < 6:
             summaries += 1
             compact.append({"id": r["id"], "kind": r["kind"], "text": " ".join(r["snippet"].split())[:400]})
+    langs = json.loads(p["languages"] or "{}")
+    total_bytes = sum(langs.values()) or 1
+    skills = {}
+    for r in conn.execute("SELECT skill, kind, origin FROM skills_observed WHERE project_id=?", (project_id,)):
+        if r["kind"] == "language" and r["origin"] == "github":
+            share = next((b for l, b in langs.items() if skill_key(canonical(l)) == skill_key(canonical(r["skill"]))), 0) / total_bytes
+            if share < min_language_share:
+                continue
+        skills[skill_key(canonical(r["skill"]))] = canonical(r["skill"])
     last = max([t for t in (p["last_commit_at"], sess["last"]) if t], key=lambda t: parse_ts(t) or datetime.min.replace(tzinfo=timezone.utc), default=None)
     return ProjectInput(
         id=p["id"], name=p["name"], url=p["url"], summary=f["summary"] if f else None,
         outcome=f["outcome"] if f else None, authorship=f["authorship"] if f else None,
         has_deployment=bool(p["has_deployment"]), deployed_url=p["deployed_url"], commit_count=p["commit_count"] or 0,
-        last_activity=last, languages=json.loads(p["languages"] or "{}"), n_sessions=sess["n"],
-        n_user_messages=sess["um"], files_edited=len(edited), readme=readme, evidence=compact)
+        last_activity=last, languages=langs, n_sessions=sess["n"],
+        n_user_messages=sess["um"], files_edited=len(edited), readme=readme, evidence=compact, skills=skills)
 
 
 # ---------- scoring ----------
@@ -237,7 +268,8 @@ class Result:
 
 
 def score_project(p: ProjectInput, j: Judgment, rubric: dict, now: datetime, username: str | None = None,
-                  judge_name: str = "") -> Result:
+                  judge_name: str = "", demand: dict | None = None, role: str | None = None) -> Result:
+    """demand: market.demand() for the target role, or None to score without the demand criterion."""
     R = rubric["projects"]
     outcome = p.outcome or ("shipped" if p.has_deployment else "unknown")
     outcome_src = "extraction" if p.outcome else ("GitHub deployment" if p.has_deployment else "no data")
@@ -253,8 +285,12 @@ def score_project(p: ProjectInput, j: Judgment, rubric: dict, now: datetime, use
         "shipped": R["shipped"].get(outcome, R["shipped"]["unknown"]),
         "recency": recency_score(p.last_activity, now, R["recency_half_life_days"]),
     }
-    score, breakdown = combine(values, R["weights"])
-    breakdown["inputs"] = {"depth": j.depth, "complexity": j.complexity, "authorship": authorship,
+    demand_skills: list[str] = []
+    if demand is not None:
+        values["demand"], demand_skills = project_demand(p.skills, demand, rubric["market"]["project_top_k"])
+    weights = active_weights(R["weights"], demand is not None)
+    score, breakdown = combine(values, weights)
+    breakdown["inputs"] = {"role": role, "demand_skills": demand_skills, "depth": j.depth, "complexity": j.complexity, "authorship": authorship,
                            "outcome": outcome, "outcome_source": outcome_src, "evidence_rows": n_evidence,
                            "evidence_kinds": sorted(kinds), "last_activity": p.last_activity,
                            "judge_evidence_ids": j.evidence_ids}
@@ -268,7 +304,7 @@ def score_project(p: ProjectInput, j: Judgment, rubric: dict, now: datetime, use
         decision = "drop"
         breakdown["rule"] = rule
     return Result(f"p{p.id}", "project", p.name, score, decision, breakdown,
-                  _project_reason(j.reason, values, R["weights"], breakdown["inputs"], rule), judge_name)
+                  _project_reason(j.reason, values, weights, breakdown["inputs"], rule), judge_name)
 
 
 def _project_reason(judge_reason: str, values: dict, weights: dict, inputs: dict, rule: str | None) -> str:
@@ -277,7 +313,8 @@ def _project_reason(judge_reason: str, values: dict, weights: dict, inputs: dict
     labels = {"depth": f"depth {inputs['depth']}/5, complexity {inputs['complexity']}/5",
               "originality": f"authorship {inputs['authorship']}", "evidence": f"{inputs['evidence_rows']} evidence rows",
               "shipped": f"outcome {inputs['outcome']}",
-              "recency": f"last active {(inputs['last_activity'] or 'unknown')[:10]}"}
+              "recency": f"last active {(inputs['last_activity'] or 'unknown')[:10]}",
+              "demand": _demand_label(values.get("demand", 0.0), inputs.get("role"), inputs.get("demand_skills") or [])}
     ranked = sorted(weights, key=lambda c: values[c])
     weak = [labels[c] for c in ranked if values[c] < 0.4][:2]
     strong = [labels[c] for c in reversed(ranked) if values[c] >= 0.7][:2]
@@ -290,8 +327,15 @@ def _project_reason(judge_reason: str, values: dict, weights: dict, inputs: dict
     return " ".join(parts)
 
 
+def _demand_label(value: float, role: str | None, skills: list[str]) -> str:
+    named = "/".join(skills[:3])
+    if value >= 0.4:
+        return f"{role} demand for {named}"
+    return f"low {role} demand" + (f" (only {named})" if named else " for its skills")
+
+
 def score_skill(name: str, rows: list[dict], kept_projects: set[int], languages_by_project: dict[int, dict],
-                rubric: dict, now: datetime) -> Result:
+                rubric: dict, now: datetime, demand: dict | None = None, role: str | None = None) -> Result:
     """rows: skills_observed joined with evidence created_at: {project_id, evidence_id, kind, created_at}."""
     S = rubric["skills"]
     k = skill_key(name)
@@ -316,9 +360,12 @@ def score_skill(name: str, rows: list[dict], kept_projects: set[int], languages_
         "recency": recency_score(latest, now, S["recency_half_life_days"]),
         "evidence": saturating(len(evidence), S["evidence_saturation"]),
     }
-    score, breakdown = combine(values, S["weights"])
+    d = demand.get(k) if demand is not None else None
+    if demand is not None:
+        values["demand"] = d.score if d else 0.0
+    score, breakdown = combine(values, active_weights(S["weights"], demand is not None))
     all_projects = {r["project_id"] for r in rows}
-    breakdown["inputs"] = {"projects_kept": len(projects), "projects_total": len(all_projects),
+    breakdown["inputs"] = {"role": role, "demand": d.as_dict() if d else None, "projects_kept": len(projects), "projects_total": len(all_projects),
                            "evidence_rows": len(evidence), "kinds": sorted({r["kind"] for r in rows}),
                            "last_seen": latest}
     if not projects:
@@ -328,6 +375,9 @@ def score_skill(name: str, rows: list[dict], kept_projects: set[int], languages_
         decision = band(score, S["thresholds"])
         reason = (f"Used in {len(projects)} kept project(s) with {len(evidence)} evidence rows; "
                   f"depth {values['depth']:.2f}; last seen {(latest or 'unknown')[:10]}.")
+        if demand is not None:
+            reason += (f" In {d.postings}/{d.total} {role} postings ({d.flag})." if d
+                       else f" No {role} posting asks for it.")
         if decision == "keep" and values["depth"] < S.get("min_depth_for_keep", 0):
             decision = "rewrite"
             breakdown["rule"] = f"depth {values['depth']:.2f} below min_depth_for_keep {S['min_depth_for_keep']}"
@@ -335,34 +385,38 @@ def score_skill(name: str, rows: list[dict], kept_projects: set[int], languages_
     return Result(f"s:{k}", "skill", name, score, decision, breakdown, reason)
 
 
-def unsupported_skill(name: str, claims: int, rubric: dict) -> Result:
+def unsupported_skill(name: str, claims: int, rubric: dict, demand: dict | None = None) -> Result:
     """A skill the model claimed but that has no evidence. Only drop or needs_evidence are allowed."""
     decision = "needs_evidence" if claims >= rubric["skills"]["needs_evidence_min_claims"] else "drop"
     breakdown = {c: {"value": 0.0, "weight": round(rubric["skills"]["weights"][c], 3), "points": 0.0} for c in SKILL_CRITERIA}
     breakdown["inputs"] = {"evidence_rows": 0, "claims_without_evidence": claims}
-    return Result(f"s:{skill_key(name)}", "skill", name, 0.0, decision, breakdown,
-                  f"Claimed {claims} time(s) during extraction with no valid evidence.")
+    reason = f"Claimed {claims} time(s) during extraction with no valid evidence."
+    d = (demand or {}).get(skill_key(name))
+    if d:
+        reason += f" In demand ({d.postings}/{d.total} postings): find or add evidence."
+    return Result(f"s:{skill_key(name)}", "skill", name, 0.0, decision, breakdown, reason)
 
 
 # ---------- run ----------
 
 def evaluate(conn, judge: Judge, rubric: dict, now: datetime | None = None,
-             fallback: Judge | None = None, on_project=None) -> list[Result]:
+             fallback: Judge | None = None, on_project=None, role: str | None = None) -> list[Result]:
+    """role: target role for the demand criterion (see market.resolve_role); None scores without demand."""
     now = now or datetime.now(timezone.utc)
+    demand = market.demand(conn, role, rubric["market"]) if role else None
     fallback = fallback or HeuristicJudge()
     username = db.get_setting(conn, "github_username")
     results: list[Result] = []
     project_ids = [r[0] for r in conn.execute("SELECT id FROM projects ORDER BY id")]
     for pid in project_ids:
-        p = project_inputs(conn, pid)
-        used = judge
+        p = project_inputs(conn, pid, rubric["market"]["min_language_share"])
         name = judge.name
         try:
             j = judge.judge(p)
         except (JudgmentRejected, LLMError) as e:
             j = fallback.judge(p)
             name = f"{fallback.name} (fallback: {str(e)[:80]})"
-        r = score_project(p, j, rubric, now, username, name)
+        r = score_project(p, j, rubric, now, username, name, demand, role)
         results.append(r)
         if on_project:
             on_project(r)
@@ -374,11 +428,11 @@ def evaluate(conn, judge: Judge, rubric: dict, now: datetime | None = None,
     names: dict[str, str] = {}
     for r in conn.execute("""SELECT so.skill, so.project_id, so.evidence_id, so.kind, e.created_at
                              FROM skills_observed so JOIN evidence e ON e.id = so.evidence_id"""):
-        k = skill_key(r["skill"])
-        names.setdefault(k, r["skill"])
+        k = skill_key(canonical(r["skill"]))  # canonical again: rows stored before an alias was added
+        names.setdefault(k, canonical(r["skill"]))
         by_skill.setdefault(k, []).append(dict(r))
     for k, rows in by_skill.items():
-        results.append(score_skill(names[k], rows, kept, langs, rubric, now))
+        results.append(score_skill(names[k], rows, kept, langs, rubric, now, demand, role))
     claims: dict[str, list[str]] = {}
     for (rej,) in conn.execute("SELECT rejected FROM project_facts"):
         for c in json.loads(rej or "[]"):
@@ -386,7 +440,8 @@ def evaluate(conn, judge: Judge, rubric: dict, now: datetime | None = None,
                 claims.setdefault(skill_key(canonical(c["name"])), []).append(canonical(c["name"]))
     for k, ns in claims.items():
         if k not in by_skill:
-            results.append(unsupported_skill(ns[0], len(ns), rubric))
+            results.append(unsupported_skill(ns[0], len(ns), rubric, demand))
+    db.set_setting(conn, "evaluated_role", role)
     _store(conn, results, rubric["hash"], now)
     return results
 
@@ -414,7 +469,7 @@ def has_evidence(conn, item_id: str) -> bool:
     if item_id.startswith("p"):
         return conn.execute("SELECT 1 FROM evidence WHERE project_id=? LIMIT 1", (int(item_id[1:]),)).fetchone() is not None
     k = item_id[2:]
-    return any(skill_key(s) == k for (s,) in conn.execute("SELECT DISTINCT skill FROM skills_observed"))
+    return any(skill_key(canonical(s)) == k for (s,) in conn.execute("SELECT DISTINCT skill FROM skills_observed"))
 
 
 def resolve_id(conn, ref: str) -> str:

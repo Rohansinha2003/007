@@ -23,6 +23,10 @@ uv run resume evaluate             # keep / rewrite / drop for every project and
 uv run resume explain p7           # full score breakdown for one item
 uv run resume override p7 drop     # your decision wins over every later evaluate run
 uv run resume override p7 --clear
+uv run resume market add postings.csv --role "ai engineer"   # also a .txt/.md file, a folder, or '-' for stdin
+uv run resume market demand        # share of postings per skill, required vs nice-to-have
+uv run resume gap --role "ai engineer"
+uv run resume evaluate --role "ai engineer"   # demand becomes a weighted criterion
 ```
 
 The database is `resume.db` in the current folder. Override with `--db PATH` or `RESUME_DB`.
@@ -96,6 +100,7 @@ Weights in each group are normalized to sum to 1, and the rubric hash is stored 
 | evidence | Log-scaled evidence row count, mixed with how many kinds of evidence exist |
 | shipped | Extracted outcome. Without extraction, a GitHub deployment counts as shipped |
 | recency | Half-life decay from the last commit or session |
+| demand | Share of the role's top-3 skill demand covered by the project's top-3 skills. Only used with `--role` and postings on file |
 
 | Skills | How the 0 to 1 value is computed |
 |---|---|
@@ -103,6 +108,7 @@ Weights in each group are normalized to sum to 1, and the rubric hash is stored 
 | depth | For languages, the byte share in the projects that use it. For extracted skills, evidence rows per project |
 | recency | Half-life decay from the newest evidence |
 | evidence | Log-scaled evidence row count |
+| demand | The skill's demand score for the role. Only used with `--role` and postings on file |
 
 Decisions:
 - A score at or above `keep` means keep, at or above `rewrite` means rewrite, and anything lower means drop.
@@ -125,6 +131,53 @@ Judges:
 
 On the real data, so far only with the heuristic judge: 12 projects keep, 10 rewrite and 38 drop, and 8 skills keep.
 Known weak spot: a repo with a committed virtualenv inflates the heuristic's code-size signal (AI-Agent shows 49 MB in 12 languages).
+
+### Market demand
+
+There is no scraping. You collect postings yourself and add them under a role label.
+
+- **`resume market add <source> --role <name>`** accepts a `.txt` or `.md` file (one posting), a CSV with the columns
+  `title, company, location, description`, a folder of those files, `-` to paste on stdin, or the posting text itself.
+  Postings are redacted and stored once per role: re-adding the same text is skipped. Role labels are lowercased.
+- **Skill extraction.** With `ANTHROPIC_API_KEY`, the LLM returns validated JSON: each skill with `required` or
+  `preferred` and the exact words from the posting. A skill whose quote is not in the posting is rejected and kept in
+  `postings.rejected`. Without a key, or if a call fails, a keyword extractor uses the alias table. It reads
+  required versus preferred from section headings such as "Requirements" and "Nice to have" and from cues such as
+  "is a plus". Ambiguous words like Go, REST, React and Express only count with that capitalization. Names go
+  through the same alias table as extraction, so `ReactJS` in a posting matches `React` in your history.
+  `resume market extract --force --extractor llm` re-extracts with the LLM later.
+- **`resume market demand`** shows each skill's share of the role's postings, its required and preferred counts, a
+  flag (`required` if at least half of the postings that mention it require it, else `nice-to-have`), and a demand score:
+  `(required + 0.5 x preferred) / postings`. The weights are in the `market` section of the rubric.
+- **`resume gap --role <name>`** prints three lists:
+  - (a) in-demand skills you have evidence for, with project and evidence counts and the current evaluation;
+  - (b) in-demand skills with no evidence, noting any that extraction claimed without valid evidence;
+  - (c) skills you have evidence for that no posting asks for.
+
+  It also prints how much of the role's total demand your evidence covers.
+- **Demand in the evaluator.** `resume evaluate --role <name>` adds a `demand` criterion, with weight 0.25 before normalization in both groups:
+  - **Skills:** the skill's demand score.
+  - **Projects:** the summed demand of the project's top 3 skills, divided by the summed demand of the role's top 3 skills.
+    Languages under 5% of a project's code are ignored.
+
+  The role is remembered for later runs. With no postings on file, the criterion is left out and the other
+  weights are rescaled, so scores match what they were before this step.
+- `resume market list` and `resume market remove` manage stored postings. `tests/data/postings_ai_engineer.csv` holds
+  10 fake postings for trying the feature offline.
+
+Tried on a copy of the real database with the 10 fake postings, keyword extraction and the heuristic judge:
+- Your evidence covers 27% of the role's demand. Python, Docker, PostgreSQL, TypeScript and C++ are in demand and backed.
+  LLM APIs, RAG and AWS are the top gaps, mostly because extraction has not run, so only languages count as evidence.
+- Projects went from 12 keep, 10 rewrite and 38 drop to 8 keep, 11 rewrite and 41 drop.
+  Chest_X_ray moved up from drop to rewrite on Python and Docker demand.
+  four-pillars, finance-buddy and ResearchOS moved down from keep to rewrite, because their TypeScript stack has little demand for this role.
+- HTML and Jupyter Notebook dropped from keep to rewrite, because no posting asks for them.
+
+The real database has no postings yet. The fake ones are test data only.
+
+Known limits for market demand:
+- The keyword extractor only knows skills in the alias table. The LLM extractor is not limited this way, but it has not run live.
+- There is no skill hierarchy, so a posting asking for "Machine learning" is not matched by evidence for PyTorch.
 
 How GitHub facts are derived:
 
@@ -161,6 +214,8 @@ To change the schema, append a new script. Never edit an applied one.
 | `llm_calls` | One row per LLM call: purpose, model, cached, attempts, tokens, cost, error |
 | `evaluations` | Latest computed score, decision, breakdown and reason per item (`p<id>` or `s:<skill>`) |
 | `overrides` | Your keep or drop decisions. Written only by `resume override` |
+| `postings` | Job postings you added: role label, title, company, location, redacted text, content hash, extractor, rejected skills |
+| `posting_skills` | Skills per posting: canonical name and key, `required` or `preferred`, and the quote that shows it |
 
 ## Other modules
 
@@ -173,4 +228,4 @@ uv run pytest
 ```
 
 GitHub tests use a fake HTTP transport. Log and export tests use small fake files in `tests/fixtures.py`
-that copy the record shapes of the real logs. All secrets in tests are fake. No network access is needed.
+that copy the record shapes of the real logs. Market tests use `tests/data/postings_ai_engineer.csv`. All secrets in tests are fake. No network access is needed.
