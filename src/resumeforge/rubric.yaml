@@ -1,0 +1,49 @@
+# Scoring rubric for `resume evaluate`. Copy and pass with --rubric to change it.
+# Weights are relative: each group is normalized to sum to 1. All criterion scores are in [0, 1].
+# Decision bands: score >= keep -> keep; score >= rewrite -> rewrite; otherwise drop.
+version: 1
+
+projects:
+  weights:
+    depth: 0.30         # judged: technical depth and complexity (LLM or local judge)
+    originality: 0.15   # from extracted authorship
+    evidence: 0.20      # how much verifiable evidence exists
+    shipped: 0.20       # deployed or released
+    recency: 0.15       # last activity
+  thresholds:
+    keep: 0.55
+    rewrite: 0.40
+  originality:          # authorship -> score
+    self_written: 1.0
+    ai_assisted: 0.7
+    mostly_ai: 0.35
+    unknown: 0.5
+  shipped:              # outcome -> score
+    shipped: 1.0
+    prototype: 0.5
+    abandoned: 0.1
+    unknown: 0.3
+  evidence:
+    saturation: 30      # this many evidence rows scores full volume
+    volume_weight: 0.6  # rest of the evidence score is kind diversity
+    kinds: [readme, commits, languages, deployment, files_touched, assistant_summary, user_message]
+  recency_half_life_days: 365
+  rules:
+    drop_without_own_work: true    # no commits by you and no linked AI sessions -> drop
+    drop_profile_repo: true        # the <username>/<username> profile README repo -> drop
+
+skills:
+  weights:
+    breadth: 0.35       # number of kept projects that use it
+    depth: 0.25         # how heavily it is used where it appears
+    recency: 0.20
+    evidence: 0.20      # number of evidence rows
+  thresholds:
+    keep: 0.50
+    rewrite: 0.30
+  breadth_saturation: 4      # projects for full breadth
+  evidence_saturation: 10    # evidence rows for full evidence score
+  depth_items_per_project: 3 # extracted skills: evidence rows per project for full depth
+  recency_half_life_days: 365
+  min_depth_for_keep: 0.05     # a skill that is a trace everywhere it appears is capped at "rewrite"
+  needs_evidence_min_claims: 2   # a skill claimed this often without evidence is "needs_evidence", else "drop"

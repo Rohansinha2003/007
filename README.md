@@ -19,6 +19,10 @@ export ANTHROPIC_API_KEY=...
 uv run resume extract              # LLM facts per project (cached; re-runs are free)
 uv run resume skills               # each skill with its count of projects and evidence
 uv run resume llm-usage            # tokens and cost from the call log
+uv run resume evaluate             # keep / rewrite / drop for every project and skill
+uv run resume explain p7           # full score breakdown for one item
+uv run resume override p7 drop     # your decision wins over every later evaluate run
+uv run resume override p7 --clear
 ```
 
 The database is `resume.db` in the current folder. Override with `--db PATH` or `RESUME_DB`.
@@ -79,6 +83,49 @@ Not verified yet: no API key was available while building this stage, so live ex
 Tests mock the model. A run on a copy of the real database with a stand-in model covered all 53 projects and
 confirmed that unsupported claims are rejected. The dry run estimates about $2 for all projects.
 
+### Evaluator
+
+`resume evaluate` scores every project and skill against `src/resumeforge/rubric.yaml` and prints a table
+with the score breakdown, a decision and a reason. Pass `--rubric my.yaml` to use your own weights and thresholds.
+Weights in each group are normalized to sum to 1, and the rubric hash is stored with each evaluation.
+
+| Projects | How the 0 to 1 value is computed |
+|---|---|
+| depth | Judged depth and complexity, each 1 to 5, averaged and scaled |
+| originality | Extracted authorship mapped through the rubric. Without extraction it is `unknown` and scores 0.5 |
+| evidence | Log-scaled evidence row count, mixed with how many kinds of evidence exist |
+| shipped | Extracted outcome. Without extraction, a GitHub deployment counts as shipped |
+| recency | Half-life decay from the last commit or session |
+
+| Skills | How the 0 to 1 value is computed |
+|---|---|
+| breadth | Number of kept projects that use it, saturating at 4 |
+| depth | For languages, the byte share in the projects that use it. For extracted skills, evidence rows per project |
+| recency | Half-life decay from the newest evidence |
+| evidence | Log-scaled evidence row count |
+
+Decisions:
+- A score at or above `keep` means keep, at or above `rewrite` means rewrite, and anything lower means drop.
+- **Rules apply after the score.** The profile README repo and repos with no commits by you and no linked AI session are dropped.
+  A skill that is only a trace in every project, like 0.3% Shell, is capped at rewrite.
+- **Skills only count kept projects.** A skill used only in dropped projects is dropped.
+- **No evidence, no claim.** A skill claimed during extraction without valid evidence gets no score.
+  It is `needs_evidence` if it was claimed at least twice, otherwise `drop`, and it cannot be overridden to keep.
+- **Overrides** live in their own table, which only `resume override` writes. Evaluation runs never change them.
+  The table marks overridden rows with `*`.
+
+Judges:
+- The LLM only rates depth and complexity and writes the one-line reason. Every other criterion is computed in code.
+- With `ANTHROPIC_API_KEY` set, `--judge auto` uses the LLM judge. It returns validated JSON, results are cached,
+  and a judgment with no valid evidence id is discarded in favor of the heuristic judge.
+- Without a key, the deterministic heuristic judge rates depth from README size, commits, files edited,
+  sessions, deployment, code size and language count.
+- To replace the LLM with a small local model, implement the `Judge` protocol in `evaluator.py` and pass it to
+  `evaluate()`. The protocol is a `name` plus `judge(ProjectInput) -> Judgment`.
+
+On the real data, so far only with the heuristic judge: 12 projects keep, 10 rewrite and 38 drop, and 8 skills keep.
+Known weak spot: a repo with a committed virtualenv inflates the heuristic's code-size signal (AI-Agent shows 49 MB in 12 languages).
+
 How GitHub facts are derived:
 
 | Field | Source |
@@ -112,6 +159,8 @@ To change the schema, append a new script. Never edit an applied one.
 | `project_facts` | One row per extracted project: summary, outcome, authorship, validated JSON, rejected claims |
 | `llm_cache` | Validated LLM results keyed by input hash |
 | `llm_calls` | One row per LLM call: purpose, model, cached, attempts, tokens, cost, error |
+| `evaluations` | Latest computed score, decision, breakdown and reason per item (`p<id>` or `s:<skill>`) |
+| `overrides` | Your keep or drop decisions. Written only by `resume override` |
 
 ## Other modules
 

@@ -119,6 +119,27 @@ MIGRATIONS: list[str] = [
         error             TEXT
     );
     """,
+    # 4: evaluator
+    """
+    CREATE TABLE evaluations (
+        item_id      TEXT PRIMARY KEY,   -- p<project id> or s:<skill key>
+        item_type    TEXT NOT NULL,      -- project | skill
+        name         TEXT NOT NULL,
+        score        REAL NOT NULL,
+        decision     TEXT NOT NULL,      -- keep | rewrite | drop | needs_evidence (computed, before overrides)
+        breakdown    TEXT NOT NULL,      -- JSON: per-criterion value, weight, contribution, inputs
+        reason       TEXT NOT NULL,
+        judge        TEXT,               -- which judge scored depth (projects)
+        rubric_hash  TEXT NOT NULL,
+        evaluated_at TEXT NOT NULL
+    );
+    CREATE TABLE overrides (
+        item_id    TEXT PRIMARY KEY,     -- same ids as evaluations; written only by `resume override`
+        decision   TEXT NOT NULL,        -- keep | drop
+        note       TEXT,
+        created_at TEXT NOT NULL
+    );
+    """,
 ]
 
 

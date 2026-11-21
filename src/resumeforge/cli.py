@@ -7,7 +7,7 @@ from pathlib import Path
 
 import typer
 
-from . import db, extract as ex, llm as llm_mod
+from . import db, evaluator as ev, extract as ex, llm as llm_mod
 from .skills import key as skill_key
 from .ingest import antigravity, claude_code, codex, common, exports, github
 
@@ -215,6 +215,133 @@ def skills(
     for x in out:
         typer.echo(f"{x['skill'][:30]:<30} {x['projects']:>8} {x['evidence']:>8}  {','.join(x['kinds'])}")
     typer.echo(f"{len(out)} skill(s)")
+
+
+DECISION_MARK = {"keep": "KEEP", "rewrite": "REWRITE", "drop": "drop", "needs_evidence": "NEEDS EVIDENCE"}
+
+
+def _row_decision(r, overrides):
+    res = ev.Result(r["item_id"], r["item_type"], r["name"], r["score"], r["decision"], {}, r["reason"])
+    d, note = ev.effective(res, overrides.get(r["item_id"]))
+    return DECISION_MARK[d] + ("*" if note == "override" else ""), note
+
+
+@app.command()
+def evaluate(
+    ctx: typer.Context,
+    judge: str = typer.Option("auto", help="Depth judge: auto, llm or heuristic"),
+    rubric: Path = typer.Option(None, help="Rubric YAML (default: the packaged rubric.yaml)"),
+    show: str = typer.Option("all", help="all, projects or skills"),
+    as_json: bool = typer.Option(False, "--json"),
+    width: int = typer.Option(70, help="Reason column width"),
+):
+    """Score projects and skills with the rubric and print keep / rewrite / drop decisions."""
+    conn = db.connect(ctx.obj["db"])
+    try:
+        rb = ev.load_rubric(rubric)
+    except (ev.RubricError, KeyError, OSError) as e:
+        typer.echo(f"error: rubric: {e}", err=True)
+        raise typer.Exit(1)
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+    if judge == "llm" and not has_key:
+        typer.echo("error: --judge llm needs ANTHROPIC_API_KEY", err=True)
+        raise typer.Exit(1)
+    if judge == "auto":
+        judge = "llm" if has_key else "heuristic"
+        if not has_key:
+            typer.echo("No ANTHROPIC_API_KEY: depth is rated by the heuristic judge.", err=True)
+    if judge not in ("llm", "heuristic"):
+        typer.echo("error: --judge must be auto, llm or heuristic", err=True)
+        raise typer.Exit(1)
+    j = ev.LLMJudge(llm_mod.LLM(conn)) if judge == "llm" else ev.HeuristicJudge()
+    if not conn.execute("SELECT 1 FROM projects LIMIT 1").fetchone():
+        typer.echo("No projects. Run: resume ingest github <username>")
+        raise typer.Exit(1)
+    ev.evaluate(conn, j, rb)
+    overrides = ev.get_overrides(conn)
+    rows = conn.execute("SELECT * FROM evaluations ORDER BY item_type, score DESC").fetchall()
+    if as_json:
+        out = []
+        for r in rows:
+            d, note = _row_decision(r, overrides)
+            out.append({**dict(r), "breakdown": json.loads(r["breakdown"]), "effective": d.rstrip("*"), "override_note": note})
+        typer.echo(json.dumps(out, indent=2))
+        return
+    if show in ("all", "projects"):
+        typer.echo(f"PROJECTS  (rubric {rb['hash']}, judge {judge}; * = your override)")
+        typer.echo(f"{'id':<5} {'project':<28} {'score':>5}  {'dep':>4} {'orig':>4} {'evid':>4} {'ship':>4} {'rec':>4}  "
+                   f"{'decision':<9} reason")
+        for r in rows:
+            if r["item_type"] != "project":
+                continue
+            b = json.loads(r["breakdown"])
+            d, _ = _row_decision(r, overrides)
+            cells = " ".join(f"{b[c]['value']:>4.2f}" for c in ev.PROJECT_CRITERIA)
+            typer.echo(f"{r['item_id']:<5} {r['name'][:28]:<28} {r['score']:>5.2f}  {cells}  {d:<9} {r['reason'][:width]}")
+    if show in ("all", "skills"):
+        typer.echo(f"\nSKILLS")
+        typer.echo(f"{'id':<22} {'skill':<20} {'score':>5}  {'brd':>4} {'dep':>4} {'rec':>4} {'evid':>4}  {'decision':<9} reason")
+        for r in rows:
+            if r["item_type"] != "skill":
+                continue
+            b = json.loads(r["breakdown"])
+            d, note = _row_decision(r, overrides)
+            cells = " ".join(f"{b[c]['value']:>4.2f}" for c in ev.SKILL_CRITERIA)
+            reason = r["reason"] + (f" ({note})" if note and note != "override" else "")
+            typer.echo(f"{r['item_id'][:22]:<22} {r['name'][:20]:<20} {r['score']:>5.2f}  {cells}  {d:<9} {reason[:width]}")
+    counts = {}
+    for r in rows:
+        d, _ = _row_decision(r, overrides)
+        counts.setdefault(r["item_type"], {}).setdefault(d.rstrip("*"), 0)
+        counts[r["item_type"]][d.rstrip("*")] += 1
+    typer.echo("\n" + "  ".join(f"{t}s: " + ", ".join(f"{v} {k.lower()}" for k, v in sorted(c.items())) for t, c in counts.items()))
+
+
+@app.command()
+def override(
+    ctx: typer.Context,
+    item: str = typer.Argument(..., help="Id from `resume evaluate` (p12, s:react) or an exact name"),
+    decision: str = typer.Argument(None, help="keep or drop"),
+    clear: bool = typer.Option(False, "--clear", help="Remove your override"),
+    note: str = typer.Option(None, help="Why (optional)"),
+):
+    """Override a decision. Overrides persist and later `evaluate` runs never change them."""
+    conn = db.connect(ctx.obj["db"])
+    try:
+        if clear:
+            typer.echo(f"cleared override for {ev.clear_override(conn, item)}")
+            return
+        if decision is None:
+            raise ev.OverrideError("give keep or drop, or --clear")
+        item_id = ev.set_override(conn, item, decision.lower(), note)
+    except ev.OverrideError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"{item_id}: {decision.lower()} (override saved)")
+
+
+@app.command()
+def explain(ctx: typer.Context, item: str = typer.Argument(..., help="Id from `resume evaluate` or an exact name")):
+    """Show the full score breakdown for one project or skill."""
+    conn = db.connect(ctx.obj["db"])
+    try:
+        item_id = ev.resolve_id(conn, item)
+    except ev.OverrideError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1)
+    r = conn.execute("SELECT * FROM evaluations WHERE item_id=?", (item_id,)).fetchone()
+    b = json.loads(r["breakdown"])
+    d, note = _row_decision(r, ev.get_overrides(conn))
+    typer.echo(f"{r['item_id']}  {r['name']}  ({r['item_type']})")
+    typer.echo(f"decision: {d.rstrip('*')}" + (f"  [{note}; computed: {r['decision']}]" if note else "")
+               + f"   score {r['score']:.3f}   rubric {r['rubric_hash']}" + (f"   judge {r['judge']}" if r["judge"] else ""))
+    for c, v in b.items():
+        if isinstance(v, dict) and "weight" in v:
+            typer.echo(f"  {c:<12} {v['value']:.3f} x {v['weight']:.3f} = {v['points']:.3f}")
+    if "rule" in b:
+        typer.echo(f"  rule: {b['rule']}")
+    typer.echo("inputs: " + json.dumps(b.get("inputs", {})))
+    typer.echo(f"reason: {r['reason']}")
 
 
 @app.command("llm-usage")
