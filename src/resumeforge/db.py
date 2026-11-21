@@ -1,148 +1,149 @@
-"""SQLite store. One file. Every skill and bullet links to evidence rows."""
+"""SQLite store with in-code migrations tracked by PRAGMA user_version.
+
+To change the schema, append a new SQL script to MIGRATIONS. Never edit an applied one.
+"""
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .redact import redact
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS evidence (
-    id          INTEGER PRIMARY KEY,
-    source      TEXT NOT NULL,          -- github | claude_code | codex
-    kind        TEXT NOT NULL,          -- repo | readme | languages | commit | prompt | session_title | files_edited
-    project_key TEXT NOT NULL,          -- normalized project name used to merge sources
-    project_name TEXT NOT NULL,         -- display name
-    ref         TEXT NOT NULL,          -- URL or file path (+ locator) the claim can be checked against
-    content     TEXT NOT NULL,          -- redacted text
-    ts          TEXT,                   -- ISO timestamp when known
-    meta        TEXT NOT NULL DEFAULT '{}',
-    UNIQUE(source, ref)
-);
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS projects (
-    project_key TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    summary     TEXT NOT NULL,
-    first_ts    TEXT,
-    last_ts     TEXT
-);
-CREATE TABLE IF NOT EXISTS skills (
-    id          INTEGER PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,   -- canonical lowercase name
-    display     TEXT NOT NULL,
-    category    TEXT NOT NULL DEFAULT 'other',
-    score       REAL,
-    include     INTEGER,
-    rationale   TEXT
-);
-CREATE TABLE IF NOT EXISTS skill_evidence (
-    skill_id    INTEGER NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
-    evidence_id INTEGER NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
-    PRIMARY KEY (skill_id, evidence_id)
-);
-CREATE TABLE IF NOT EXISTS bullets (
-    id          INTEGER PRIMARY KEY,
-    resume_id   TEXT NOT NULL,
-    project_key TEXT NOT NULL,
-    text        TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS bullet_evidence (
-    bullet_id   INTEGER NOT NULL REFERENCES bullets(id) ON DELETE CASCADE,
-    evidence_id INTEGER NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
-    PRIMARY KEY (bullet_id, evidence_id)
-);
-"""
+MIGRATIONS: list[str] = [
+    # 1: initial schema
+    """
+    CREATE TABLE projects (
+        id              INTEGER PRIMARY KEY,
+        source          TEXT NOT NULL,            -- github, ...
+        external_id     TEXT NOT NULL,            -- stable id in the source (GitHub repo id)
+        name            TEXT NOT NULL,
+        url             TEXT,
+        description     TEXT,
+        primary_language TEXT,
+        languages       TEXT NOT NULL DEFAULT '{}',  -- JSON {language: bytes}
+        topics          TEXT NOT NULL DEFAULT '[]',  -- JSON list
+        stars           INTEGER NOT NULL DEFAULT 0,
+        commit_count    INTEGER,                  -- commits authored by the user
+        first_commit_at TEXT,
+        last_commit_at  TEXT,
+        deployed_url    TEXT,
+        has_deployment  INTEGER NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL,
+        UNIQUE (source, external_id)
+    );
+    CREATE TABLE evidence (
+        id          INTEGER PRIMARY KEY,
+        project_id  INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+        source      TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        url_or_path TEXT NOT NULL,
+        snippet     TEXT NOT NULL,                -- always redacted
+        created_at  TEXT NOT NULL,
+        UNIQUE (source, kind, url_or_path)
+    );
+    CREATE INDEX evidence_project ON evidence(project_id);
+    CREATE TABLE skills_observed (
+        skill       TEXT NOT NULL,
+        project_id  INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+        evidence_id INTEGER NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+        PRIMARY KEY (skill, evidence_id)
+    );
+    CREATE TABLE sessions (
+        id          INTEGER PRIMARY KEY,
+        source      TEXT NOT NULL,                -- claude_code, codex, ...
+        external_id TEXT NOT NULL,
+        project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+        path        TEXT,
+        title       TEXT,
+        started_at  TEXT,
+        ended_at    TEXT,
+        UNIQUE (source, external_id)
+    );
+    CREATE TABLE settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL                       -- JSON
+    );
+    """,
+]
 
 
-class NoEvidenceError(ValueError):
-    """Raised when a claim is written without valid evidence."""
-
-
-def project_key(name: str) -> str:
-    """Normalize project names so 'Small_CRM', 'Small-CRM' and 'small-crm-main' merge."""
-    k = name.strip().lower()
-    k = re.sub(r"[-_]main$", "", k)
-    return re.sub(r"[^a-z0-9]", "", k)
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
 
 
-def add_evidence(conn, *, source, kind, project_name, ref, content, ts=None, meta=None) -> int:
-    """Insert or update evidence (idempotent on source+ref). Content is always redacted."""
+def migrate(conn: sqlite3.Connection) -> int:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    for i, script in enumerate(MIGRATIONS[version:], start=version + 1):
+        with conn:  # one transaction per migration
+            conn.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {i};\nCOMMIT;")
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+class NoEvidenceError(ValueError):
+    """A skill or claim was recorded without a valid evidence row."""
+
+
+def upsert_project(conn, *, source: str, external_id: str, name: str, **fields) -> int:
+    """Insert or update by (source, external_id). JSON-encodes dict/list fields."""
+    fields = {k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in fields.items()}
+    cols = ["source", "external_id", "name", *fields, "created_at", "updated_at"]
+    ts = now()
+    vals = [source, str(external_id), name, *fields.values(), ts, ts]
+    updates = ", ".join(f"{c}=excluded.{c}" for c in ["name", *fields, "updated_at"])
     conn.execute(
-        """INSERT INTO evidence(source, kind, project_key, project_name, ref, content, ts, meta)
-           VALUES (?,?,?,?,?,?,?,?)
-           ON CONFLICT(source, ref) DO UPDATE SET content=excluded.content, ts=excluded.ts,
-               meta=excluded.meta, kind=excluded.kind""",
-        (source, kind, project_key(project_name), project_name, ref, redact(content), ts,
-         json.dumps(meta or {})),
+        f"INSERT INTO projects ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))}) "
+        f"ON CONFLICT(source, external_id) DO UPDATE SET {updates}",
+        vals,
     )
-    return conn.execute("SELECT id FROM evidence WHERE source=? AND ref=?", (source, ref)).fetchone()[0]
+    return conn.execute("SELECT id FROM projects WHERE source=? AND external_id=?",
+                        (source, str(external_id))).fetchone()[0]
 
 
-def _valid_ids(conn, ids, project_key_=None) -> list[int]:
-    ids = sorted({int(i) for i in ids})
-    if not ids:
-        return []
-    q = f"SELECT id FROM evidence WHERE id IN ({','.join('?' * len(ids))})"
-    args: list = list(ids)
-    if project_key_ is not None:
-        q += " AND project_key=?"
-        args.append(project_key_)
-    return [r[0] for r in conn.execute(q, args)]
-
-
-def add_skill(conn, *, name, display=None, category="other", evidence_ids) -> int:
-    valid = _valid_ids(conn, evidence_ids)
-    if not valid:
-        raise NoEvidenceError(f"skill {name!r} has no valid evidence")
-    canon = name.strip().lower()
+def upsert_evidence(conn, *, project_id: int | None, source: str, kind: str, url_or_path: str,
+                    snippet: str, created_at: str | None = None) -> int:
+    """Insert or refresh by (source, kind, url_or_path). Snippet is redacted before storage."""
     conn.execute(
-        """INSERT INTO skills(name, display, category) VALUES (?,?,?)
-           ON CONFLICT(name) DO NOTHING""",
-        (canon, display or name.strip(), category),
+        """INSERT INTO evidence (project_id, source, kind, url_or_path, snippet, created_at)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(source, kind, url_or_path) DO UPDATE SET
+               project_id=excluded.project_id, snippet=excluded.snippet, created_at=excluded.created_at""",
+        (project_id, source, kind, url_or_path, redact(snippet), created_at or now()),
     )
-    sid = conn.execute("SELECT id FROM skills WHERE name=?", (canon,)).fetchone()[0]
-    conn.executemany("INSERT OR IGNORE INTO skill_evidence VALUES (?,?)", [(sid, e) for e in valid])
-    return sid
+    return conn.execute("SELECT id FROM evidence WHERE source=? AND kind=? AND url_or_path=?",
+                        (source, kind, url_or_path)).fetchone()[0]
 
 
-def add_bullet(conn, *, resume_id, project_key_, text, evidence_ids) -> int:
-    """Bullets may only cite evidence belonging to their own project."""
-    valid = _valid_ids(conn, evidence_ids, project_key_)
-    if not valid:
-        raise NoEvidenceError(f"bullet has no valid evidence: {text[:60]!r}")
-    cur = conn.execute("INSERT INTO bullets(resume_id, project_key, text) VALUES (?,?,?)",
-                       (resume_id, project_key_, text))
-    conn.executemany("INSERT INTO bullet_evidence VALUES (?,?)", [(cur.lastrowid, e) for e in valid])
-    return cur.lastrowid
+def observe_skill(conn, *, skill: str, evidence_id: int) -> None:
+    """Record a skill against an evidence row. The project is taken from the evidence row."""
+    row = conn.execute("SELECT project_id FROM evidence WHERE id=?", (evidence_id,)).fetchone()
+    if row is None:
+        raise NoEvidenceError(f"skill {skill!r}: evidence {evidence_id} does not exist")
+    conn.execute("INSERT OR IGNORE INTO skills_observed (skill, project_id, evidence_id) VALUES (?,?,?)",
+                 (skill.strip(), row[0], evidence_id))
 
 
-def evidence_for_project(conn, key: str) -> list[sqlite3.Row]:
-    return conn.execute("SELECT * FROM evidence WHERE project_key=? ORDER BY ts, id", (key,)).fetchall()
+def set_setting(conn, key: str, value) -> None:
+    conn.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
 
 
-def project_keys(conn) -> list[str]:
-    return [r[0] for r in conn.execute("SELECT DISTINCT project_key FROM evidence ORDER BY project_key")]
-
-
-def set_meta(conn, key: str, value) -> None:
-    conn.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, json.dumps(value)))
-    conn.commit()
-
-
-def get_meta(conn, key: str, default=None):
-    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+def get_setting(conn, key: str, default=None):
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return json.loads(row[0]) if row else default
+
+
+def list_projects(conn) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT p.*, (SELECT COUNT(*) FROM evidence e WHERE e.project_id=p.id) AS evidence_count
+           FROM projects p ORDER BY p.last_commit_at IS NULL, p.last_commit_at DESC, p.name"""
+    ).fetchall()

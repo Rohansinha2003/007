@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-resumeforge = "resumeforge.cli:app"
+resume = "resumeforge.cli:app"
 
 [dependency-groups]
 dev = ["pytest>=8"]
@@ -24,3 +24,4 @@ packages = ["src/resumeforge"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-q"

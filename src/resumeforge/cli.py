@@ -1,112 +1,71 @@
-"""resumeforge CLI."""
+"""`resume` CLI."""
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-from typing import Optional
 
 import typer
 
-from . import db, evaluate as ev, extract as ex, llm, resume as rs
-from .ingest import claude_code, codex, github
+from . import db
+from .ingest import github
 
-app = typer.Typer(add_completion=False, help="Evidence-based resume builder. No evidence, no claim.")
+app = typer.Typer(add_completion=False, no_args_is_help=True,
+                  help="Evidence-based resume builder. No evidence, no claim.")
+ingest_app = typer.Typer(no_args_is_help=True, help="Import work history into the database.")
+app.add_typer(ingest_app, name="ingest")
 
-DBOpt = typer.Option(Path(os.environ.get("RESUMEFORGE_DB", "resumeforge.db")), "--db", help="SQLite file")
-
-
-def _jd(path: Optional[Path]) -> Optional[str]:
-    return path.read_text() if path else None
-
-
-@app.command()
-def ingest(
-    db_path: Path = DBOpt,
-    use_github: bool = typer.Option(True, "--github/--no-github"),
-    use_claude: bool = typer.Option(True, "--claude/--no-claude"),
-    use_codex: bool = typer.Option(True, "--codex/--no-codex"),
-    claude_root: Path = typer.Option(claude_code.DEFAULT_ROOT),
-    codex_root: Path = typer.Option(codex.DEFAULT_ROOT),
-):
-    """Read work history into the evidence table (redacted)."""
-    conn = db.connect(db_path)
-    if use_github:
-        try:
-            typer.echo(f"github: {github.ingest(conn)} evidence rows")
-            db.set_meta(conn, "profile", github.profile())
-        except (RuntimeError, FileNotFoundError) as e:
-            typer.echo(f"github: skipped ({e})", err=True)
-    if use_claude and claude_root.exists():
-        typer.echo(f"claude_code: {claude_code.ingest(conn, claude_root)} evidence rows")
-    if use_codex and codex_root.exists():
-        typer.echo(f"codex: {codex.ingest(conn, codex_root)} evidence rows")
-    _status(conn)
+DB_PATH = Path(os.environ.get("RESUME_DB", "resume.db"))
 
 
-@app.command()
-def extract(
-    db_path: Path = DBOpt,
-    offline: bool = typer.Option(False, help="Keyword heuristics instead of the LLM"),
-    project: list[str] = typer.Option(None, help="Limit to these projects"),
-):
-    """Extract projects and evidence-linked skills."""
-    conn = db.connect(db_path)
+@app.callback()
+def main(ctx: typer.Context, db_path: Path = typer.Option(DB_PATH, "--db", help="SQLite file (env RESUME_DB)")):
+    ctx.obj = {"db": db_path}
+
+
+def make_client() -> github.GitHubClient:
+    """Factory so tests can swap in a mocked transport."""
+    return github.GitHubClient(
+        token=os.environ.get("GITHUB_TOKEN") or None,
+        on_wait=lambda s, why: typer.echo(f"  {why}: waiting {s:.0f}s", err=True),
+    )
+
+
+@ingest_app.command("github")
+def ingest_github(ctx: typer.Context, username: str):
+    """Import a user's non-fork public repos. Safe to re-run."""
+    conn = db.connect(ctx.obj["db"])
+    gh = make_client()
+    if not gh.token:
+        typer.echo("No GITHUB_TOKEN set: unauthenticated limit is 60 requests/hour.", err=True)
     try:
-        stats = ex.extract_all(conn, offline=offline, only=project or None)
-    except llm.LLMError as e:
+        stats = github.ingest(conn, gh, username, on_repo=lambda n: typer.echo(f"  {n}"))
+    except github.RateLimitError as e:
+        typer.echo(f"error: {e}\nRe-run later; finished repos are saved.", err=True)
+        raise typer.Exit(2)
+    except github.GitHubError as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(1)
-    for k, n in stats.items():
-        typer.echo(f"{k}: {n} skills")
+    typer.echo(json.dumps(stats))
 
 
 @app.command()
-def evaluate(db_path: Path = DBOpt, jd: Optional[Path] = typer.Option(None, help="Job description text file")):
-    """Score skills against evidence, recency, market demand and an optional job description."""
-    conn = db.connect(db_path)
-    for r in ev.evaluate(conn, _jd(jd)):
-        mark = "+" if r["include"] else "-"
-        typer.echo(f"{mark} {r['score']:.2f}  {r['name']:<28} {r['rationale']}")
-
-
-@app.command()
-def generate(
-    db_path: Path = DBOpt,
-    jd: Optional[Path] = typer.Option(None, help="Job description text file"),
-    offline: bool = typer.Option(False, help="Template bullets instead of the LLM"),
-    projects: int = typer.Option(4, help="Number of projects"),
-    out: Path = typer.Option(Path("out")),
-    name: Optional[str] = typer.Option(None, help="Override display name"),
-):
-    """Write resume.md (with [E#] citations), resume.clean.md and resume.evidence.md."""
-    conn = db.connect(db_path)
-    jd_text = _jd(jd)
-    ev.evaluate(conn, jd_text)
-    profile = db.get_meta(conn, "profile", {"name": "Your Name", "url": "", "location": None})
-    if name:
-        profile["name"] = name
-    try:
-        res = rs.generate(conn, profile=profile, jd=jd_text, offline=offline, n_projects=projects, out_dir=out)
-    except llm.LLMError as e:
-        typer.echo(f"error: {e}", err=True)
-        raise typer.Exit(1)
-    typer.echo(json.dumps(res, indent=2))
-
-
-def _status(conn):
-    for r in conn.execute("SELECT source, kind, COUNT(*) n FROM evidence GROUP BY 1,2 ORDER BY 1,2"):
-        typer.echo(f"  {r['source']:<12} {r['kind']:<14} {r['n']}")
-
-
-@app.command()
-def status(db_path: Path = DBOpt):
-    """Show evidence, project and skill counts."""
-    conn = db.connect(db_path)
-    _status(conn)
-    p = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
-    s = conn.execute("SELECT COUNT(*), SUM(include) FROM skills").fetchone()
-    typer.echo(f"projects: {p}  skills: {s[0]} (included: {s[1] or 0})")
+def projects(ctx: typer.Context, as_json: bool = typer.Option(False, "--json")):
+    """List imported projects."""
+    rows = db.list_projects(db.connect(ctx.obj["db"]))
+    if as_json:
+        typer.echo(json.dumps([dict(r) for r in rows], indent=2))
+        return
+    if not rows:
+        typer.echo("No projects. Run: resume ingest github <username>")
+        return
+    typer.echo(f"{'name':<34} {'lang':<12} {'★':>3} {'commits':>7}  {'first':<10}  {'last':<10}  {'ev':>3}  deployed")
+    for r in rows:
+        dep = r["deployed_url"] or ("yes" if r["has_deployment"] else "")
+        typer.echo(f"{r['name'][:34]:<34} {(r['primary_language'] or '-')[:12]:<12} {r['stars']:>3} "
+                   f"{r['commit_count'] or 0:>7}  {(r['first_commit_at'] or '-')[:10]:<10}  "
+                   f"{(r['last_commit_at'] or '-')[:10]:<10}  {r['evidence_count']:>3}  {dep}")
+    typer.echo(f"{len(rows)} project(s)")
 
 
 if __name__ == "__main__":
