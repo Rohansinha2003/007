@@ -80,6 +80,45 @@ MIGRATIONS: list[str] = [
     CREATE INDEX evidence_session ON evidence(session_id);
     CREATE INDEX sessions_project ON sessions(project_id);
     """,
+    # 3: extraction stage
+    """
+    ALTER TABLE skills_observed ADD COLUMN kind TEXT NOT NULL DEFAULT 'skill';       -- skill | technology | language
+    ALTER TABLE skills_observed ADD COLUMN origin TEXT NOT NULL DEFAULT 'github';    -- github | llm
+    UPDATE skills_observed SET kind = 'language';
+    CREATE TABLE project_facts (
+        project_id        INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+        summary           TEXT,
+        outcome           TEXT,          -- shipped | prototype | abandoned | NULL when unsupported
+        outcome_reason    TEXT,
+        authorship        TEXT,          -- self_written | ai_assisted | mostly_ai | unknown
+        authorship_reason TEXT,
+        facts             TEXT NOT NULL, -- validated JSON with evidence ids
+        rejected          TEXT NOT NULL DEFAULT '[]',  -- claims dropped for lack of valid evidence
+        model             TEXT,
+        input_hash        TEXT NOT NULL,
+        extracted_at      TEXT NOT NULL
+    );
+    CREATE TABLE llm_cache (
+        key        TEXT PRIMARY KEY,     -- sha256 of model, prompt and schema
+        model      TEXT NOT NULL,
+        response   TEXT NOT NULL,        -- validated JSON
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE llm_calls (
+        id                INTEGER PRIMARY KEY,
+        ts                TEXT NOT NULL,
+        purpose           TEXT,
+        model             TEXT,
+        cached            INTEGER NOT NULL DEFAULT 0,
+        ok                INTEGER NOT NULL,
+        attempts          INTEGER NOT NULL DEFAULT 1,
+        input_tokens      INTEGER NOT NULL DEFAULT 0,
+        output_tokens     INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd          REAL,
+        error             TEXT
+    );
+    """,
 ]
 
 
@@ -140,13 +179,18 @@ def upsert_evidence(conn, *, project_id: int | None, source: str, kind: str, url
                         (source, kind, url_or_path)).fetchone()[0]
 
 
-def observe_skill(conn, *, skill: str, evidence_id: int) -> None:
-    """Record a skill against an evidence row. The project is taken from the evidence row."""
+def observe_skill(conn, *, skill: str, evidence_id: int, kind: str = "skill", origin: str = "github") -> None:
+    """Record a skill against an evidence row. The project is taken from the evidence row.
+    The name is normalized through the alias table in skills.py."""
+    from .skills import canonical
     row = conn.execute("SELECT project_id FROM evidence WHERE id=?", (evidence_id,)).fetchone()
     if row is None:
         raise NoEvidenceError(f"skill {skill!r}: evidence {evidence_id} does not exist")
-    conn.execute("INSERT OR IGNORE INTO skills_observed (skill, project_id, evidence_id) VALUES (?,?,?)",
-                 (skill.strip(), row[0], evidence_id))
+    name = canonical(skill)
+    if not name:
+        raise ValueError("empty skill name")
+    conn.execute("INSERT OR IGNORE INTO skills_observed (skill, project_id, evidence_id, kind, origin) VALUES (?,?,?,?,?)",
+                 (name, row[0], evidence_id, kind, origin))
 
 
 def set_setting(conn, key: str, value) -> None:

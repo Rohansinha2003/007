@@ -14,6 +14,11 @@ uv run resume ingest logs          # Claude Code, Codex and Antigravity sessions
 uv run resume ingest export ~/Downloads/chatgpt-export.zip   # ChatGPT or Claude.ai export
 uv run resume sessions --stats     # counts per source
 uv run resume sessions             # recent sessions with their linked project
+uv run resume extract --dry-run    # build prompts, estimate tokens and cost, no API calls
+export ANTHROPIC_API_KEY=...
+uv run resume extract              # LLM facts per project (cached; re-runs are free)
+uv run resume skills               # each skill with its count of projects and evidence
+uv run resume llm-usage            # tokens and cost from the call log
 ```
 
 The database is `resume.db` in the current folder. Override with `--db PATH` or `RESUME_DB`.
@@ -48,6 +53,32 @@ The database is `resume.db` in the current folder. Override with `--db PATH` or 
 - **`resume sessions --stats`** shows counts per source: sessions, linked sessions, user and assistant messages,
   evidence rows, and rows with redactions.
 
+- **`resume extract`** sends each project's redacted README, commit stats, deployment, languages and linked
+  session evidence to the LLM. The reply must match a JSON schema with a summary, technologies, skills, an outcome
+  (shipped, prototype or abandoned) and an authorship estimate (self_written, ai_assisted, mostly_ai or unknown)
+  with a reason. Every technology, skill, outcome and authorship claim carries evidence ids.
+- **No evidence, no claim.** A claim is rejected unless it cites at least one evidence id that was in the prompt
+  for that project. Invalid ids are dropped from otherwise supported claims. An unsupported outcome becomes empty,
+  and an unsupported authorship becomes `unknown`. Rejected claims are kept in `project_facts.rejected` for review.
+  Accepted technologies and skills go into `skills_observed`.
+- **Authorship needs logs.** The model is told that missing session logs are not proof of self-written code, so
+  projects without linked sessions should come back `unknown`. `unknown` is a fourth value beyond the three requested.
+- **Skill names are normalized** through the alias table in `skills.py`, so React.js, ReactJS and React are one skill.
+- **`resume skills`** lists each skill with its number of projects and evidence rows, filterable by kind
+  (`language` from GitHub, `technology` and `skill` from extraction).
+
+LLM wrapper (`llm.py`):
+- Sends the pydantic model's JSON schema as the required output format and validates the reply against it.
+- Retries invalid JSON up to three attempts, telling the model what was wrong, and doubles `max_tokens` after a truncated reply.
+  The Anthropic SDK retries rate limits, server errors and connection failures with backoff.
+- Caches validated results in `llm_cache` by a SHA-256 hash of model, prompt and schema.
+- Logs every call, cache hits and failures included, in `llm_calls` with tokens and cost.
+  Prices are a dated snapshot in `PRICES`. Default model is `claude-opus-5-5` with server-side refusal fallback.
+
+Not verified yet: no API key was available while building this stage, so live extraction has not run.
+Tests mock the model. A run on a copy of the real database with a stand-in model covered all 53 projects and
+confirmed that unsupported claims are rejected. The dry run estimates about $2 for all projects.
+
 How GitHub facts are derived:
 
 | Field | Source |
@@ -75,14 +106,15 @@ To change the schema, append a new script. Never edit an applied one.
 |---|---|
 | `projects` | One row per repo, unique on source plus external id |
 | `evidence` | `id, project_id, source, kind, url_or_path, snippet, created_at`, plus `session_id` for session evidence |
-| `skills_observed` | `skill, project_id, evidence_id`; the evidence id is required |
+| `skills_observed` | `skill, project_id, evidence_id, kind, origin`; the evidence id is required |
 | `sessions` | One row per AI-tool session or chat: tool, kind, dates, project path, linked project and how it was linked, message counts, files touched, last summary |
 | `settings` | Key-value JSON, such as the GitHub username and the last ingest time |
+| `project_facts` | One row per extracted project: summary, outcome, authorship, validated JSON, rejected claims |
+| `llm_cache` | Validated LLM results keyed by input hash |
+| `llm_calls` | One row per LLM call: purpose, model, cached, attempts, tokens, cost, error |
 
 ## Other modules
 
-- `llm.py` is the single LLM wrapper. It uses the Anthropic API with `ANTHROPIC_API_KEY`, requests
-  structured JSON, validates it with pydantic, and redacts input first. Nothing calls it yet.
 - `redact.py` removes API keys, tokens, JWTs, database URLs with passwords, private keys, secret assignments and emails.
 
 ## Tests

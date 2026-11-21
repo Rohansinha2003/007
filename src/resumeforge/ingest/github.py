@@ -225,7 +225,7 @@ def import_repo(conn, gh: GitHubClient, user: str, repo: dict) -> int:
         kept.append(lang_id)
         conn.execute("DELETE FROM skills_observed WHERE evidence_id=?", (lang_id,))
         for lang in languages:
-            db.observe_skill(conn, skill=lang, evidence_id=lang_id)
+            db.observe_skill(conn, skill=lang, evidence_id=lang_id, kind="language")
     if rd:
         kept.append(ev("readme", rd[1], rd[0][:README_CHARS]))
     if topics:

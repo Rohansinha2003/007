@@ -7,7 +7,8 @@ from pathlib import Path
 
 import typer
 
-from . import db
+from . import db, extract as ex, llm as llm_mod
+from .skills import key as skill_key
 from .ingest import antigravity, claude_code, codex, common, exports, github
 
 app = typer.Typer(add_completion=False, no_args_is_help=True,
@@ -126,6 +127,109 @@ def sessions(ctx: typer.Context, stats: bool = typer.Option(False, "--stats", he
         typer.echo(f"{(r['ended_at'] or r['started_at'] or '-')[:10]}  {r['source']:<11} "
                    f"{(r['title'] or '(untitled)')[:44]:<44} msgs {r['user_message_count']:>3}/{r['assistant_message_count']:<3} "
                    f"files {len(files.get('edited', [])):>3}  -> {r['project'] or '-'}")
+
+
+@app.command()
+def extract(
+    ctx: typer.Context,
+    project: list[str] = typer.Option(None, "--project", "-p", help="Only these project names (repeatable)"),
+    limit: int = typer.Option(0, help="Stop after N projects (0 = all)"),
+    min_evidence: int = typer.Option(2, help="Skip projects with fewer evidence rows"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Build prompts and estimate cost; no LLM calls"),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Ignore cached LLM results"),
+    show_prompt: bool = typer.Option(False, help="With --dry-run, print each prompt"),
+):
+    """Extract summary, technologies, skills, outcome and authorship per project with the LLM."""
+    conn = db.connect(ctx.obj["db"])
+    ids = ex.candidate_projects(conn, min_evidence, project or None)
+    if limit:
+        ids = ids[:limit]
+    if not ids:
+        typer.echo("No projects with enough evidence. Run the ingest commands first.")
+        raise typer.Exit(1)
+    if dry_run:
+        price = llm_mod.PRICES.get(llm_mod.MODEL, (0, 0, 0))
+        total_in = 0
+        for pid in ids:
+            pack = ex.build_pack(conn, pid)
+            est = (len(ex.SYSTEM) + len(pack.prompt)) // 3  # rough: ~3 chars per token for mixed code/prose
+            total_in += est
+            typer.echo(f"{pack.name[:34]:<34} {len(pack.evidence_ids):>4} evidence  ~{est:>6} input tokens")
+            if show_prompt:
+                typer.echo(pack.prompt + "\n" + "-" * 80)
+        cost = (total_in * price[0] + len(ids) * 1500 * price[1]) / 1e6
+        typer.echo(f"{len(ids)} projects, ~{total_in} input tokens, est. ${cost:.2f} with {llm_mod.MODEL} "
+                   f"(assumes ~1500 output tokens each)")
+        return
+    client = llm_mod.LLM(conn)
+    run_start = conn.execute("SELECT COALESCE(MAX(id), 0) FROM llm_calls").fetchone()[0]
+    failed = 0
+    for pid in ids:
+        try:
+            r = ex.extract_project(conn, client, pid, use_cache=not no_cache)
+        except llm_mod.LLMError as e:
+            if "not set" in str(e):
+                typer.echo(f"error: {e} Use --dry-run to check the prompts without calling the API.", err=True)
+                raise typer.Exit(1)
+            failed += 1
+            typer.echo(f"  {pid}: failed: {e}", err=True)
+            continue
+        typer.echo(f"  {r['project'][:34]:<34} tech {r['technologies']:>2}  skills {r['skills']:>2}  "
+                   f"rejected {r['rejected']:>2}  {r['outcome'] or '-':<10} {r['authorship']}")
+    u = conn.execute("""SELECT COUNT(*) calls, SUM(cached) hits, SUM(input_tokens) i, SUM(output_tokens) o,
+                               SUM(cost_usd) c FROM llm_calls WHERE id > ?""", (run_start,)).fetchone()
+    typer.echo(f"{len(ids) - failed} extracted, {failed} failed. LLM: {u['calls']} calls, {u['hits'] or 0} cached, "
+               f"{u['i'] or 0} in / {u['o'] or 0} out tokens, ${u['c'] or 0:.4f}")
+
+
+@app.command()
+def skills(
+    ctx: typer.Context,
+    min_projects: int = typer.Option(1, help="Hide skills seen in fewer projects"),
+    kind: str = typer.Option(None, help="language, technology or skill"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Skills with their count of projects and evidence rows."""
+    conn = db.connect(ctx.obj["db"])
+    rows = conn.execute("SELECT skill, project_id, evidence_id, kind, origin FROM skills_observed"
+                        + (" WHERE kind=?" if kind else ""), (kind,) if kind else ()).fetchall()
+    groups: dict[str, dict] = {}
+    for r in rows:
+        g = groups.setdefault(skill_key(r["skill"]), {"skill": r["skill"], "projects": set(), "evidence": set(),
+                                                      "kinds": set(), "origins": set()})
+        g["projects"].add(r["project_id"])
+        g["evidence"].add(r["evidence_id"])
+        g["kinds"].add(r["kind"])
+        g["origins"].add(r["origin"])
+    out = sorted(({"skill": g["skill"], "projects": len(g["projects"]), "evidence": len(g["evidence"]),
+                   "kinds": sorted(g["kinds"]), "origins": sorted(g["origins"])}
+                  for g in groups.values() if len(g["projects"]) >= min_projects),
+                 key=lambda x: (-x["projects"], -x["evidence"], x["skill"].lower()))
+    if as_json:
+        typer.echo(json.dumps(out, indent=2))
+        return
+    if not out:
+        typer.echo("No skills yet. Run: resume ingest github <user>, then resume extract")
+        return
+    typer.echo(f"{'skill':<30} {'projects':>8} {'evidence':>8}  kind")
+    for x in out:
+        typer.echo(f"{x['skill'][:30]:<30} {x['projects']:>8} {x['evidence']:>8}  {','.join(x['kinds'])}")
+    typer.echo(f"{len(out)} skill(s)")
+
+
+@app.command("llm-usage")
+def llm_usage(ctx: typer.Context):
+    """Token and cost totals from the LLM call log."""
+    conn = db.connect(ctx.obj["db"])
+    rows = conn.execute("""SELECT purpose, model, COUNT(*) calls, SUM(cached) cached, SUM(1-ok) failed,
+                                  SUM(input_tokens) i, SUM(output_tokens) o, SUM(cost_usd) c
+                           FROM llm_calls GROUP BY purpose, model""").fetchall()
+    if not rows:
+        typer.echo("No LLM calls logged.")
+        return
+    for r in rows:
+        typer.echo(f"{r['purpose'] or '-':<18} {r['model']:<18} calls {r['calls']:>4}  cached {r['cached']:>4}  "
+                   f"failed {r['failed']:>3}  in {r['i']:>8}  out {r['o']:>7}  ${r['c'] or 0:.4f}")
 
 
 @app.command()
