@@ -9,7 +9,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .redact import redact
+from .redact import redact, redact_obj
 
 MIGRATIONS: list[str] = [
     # 1: initial schema
@@ -67,6 +67,19 @@ MIGRATIONS: list[str] = [
         value TEXT NOT NULL                       -- JSON
     );
     """,
+    # 2: richer sessions; evidence can belong to a session
+    """
+    ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'coding';   -- coding | chat
+    ALTER TABLE sessions ADD COLUMN project_path TEXT;
+    ALTER TABLE sessions ADD COLUMN link_method TEXT;                     -- how project_id was matched
+    ALTER TABLE sessions ADD COLUMN user_message_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE sessions ADD COLUMN assistant_message_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE sessions ADD COLUMN files_touched TEXT NOT NULL DEFAULT '{}';  -- {"edited": [...], "read": [...]}
+    ALTER TABLE sessions ADD COLUMN summary TEXT;                         -- last assistant summary
+    ALTER TABLE evidence ADD COLUMN session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE;
+    CREATE INDEX evidence_session ON evidence(session_id);
+    CREATE INDEX sessions_project ON sessions(project_id);
+    """,
 ]
 
 
@@ -96,7 +109,9 @@ class NoEvidenceError(ValueError):
 
 def upsert_project(conn, *, source: str, external_id: str, name: str, **fields) -> int:
     """Insert or update by (source, external_id). JSON-encodes dict/list fields."""
-    fields = {k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in fields.items()}
+    fields = {k: json.dumps(redact_obj(v)) if isinstance(v, (dict, list)) else
+              redact(v) if isinstance(v, str) and k not in ("url", "deployed_url") else v
+              for k, v in fields.items()}
     cols = ["source", "external_id", "name", *fields, "created_at", "updated_at"]
     ts = now()
     vals = [source, str(external_id), name, *fields.values(), ts, ts]
@@ -111,14 +126,15 @@ def upsert_project(conn, *, source: str, external_id: str, name: str, **fields) 
 
 
 def upsert_evidence(conn, *, project_id: int | None, source: str, kind: str, url_or_path: str,
-                    snippet: str, created_at: str | None = None) -> int:
+                    snippet: str, created_at: str | None = None, session_id: int | None = None) -> int:
     """Insert or refresh by (source, kind, url_or_path). Snippet is redacted before storage."""
     conn.execute(
-        """INSERT INTO evidence (project_id, source, kind, url_or_path, snippet, created_at)
-           VALUES (?,?,?,?,?,?)
+        """INSERT INTO evidence (project_id, source, kind, url_or_path, snippet, created_at, session_id)
+           VALUES (?,?,?,?,?,?,?)
            ON CONFLICT(source, kind, url_or_path) DO UPDATE SET
-               project_id=excluded.project_id, snippet=excluded.snippet, created_at=excluded.created_at""",
-        (project_id, source, kind, url_or_path, redact(snippet), created_at or now()),
+               project_id=excluded.project_id, snippet=excluded.snippet, created_at=excluded.created_at,
+               session_id=excluded.session_id""",
+        (project_id, source, kind, url_or_path, redact(snippet), created_at or now(), session_id),
     )
     return conn.execute("SELECT id FROM evidence WHERE source=? AND kind=? AND url_or_path=?",
                         (source, kind, url_or_path)).fetchone()[0]
@@ -147,3 +163,26 @@ def list_projects(conn) -> list[sqlite3.Row]:
         """SELECT p.*, (SELECT COUNT(*) FROM evidence e WHERE e.project_id=p.id) AS evidence_count
            FROM projects p ORDER BY p.last_commit_at IS NULL, p.last_commit_at DESC, p.name"""
     ).fetchall()
+
+
+SESSION_TEXT_FIELDS = ("title", "summary")
+
+
+def upsert_session(conn, *, source: str, external_id: str, **fields) -> int:
+    """Insert or update by (source, external_id). Text fields are redacted; dict/list fields JSON-encoded."""
+    clean = {}
+    for k, v in fields.items():
+        if isinstance(v, (dict, list)):
+            v = json.dumps(redact_obj(v))
+        elif k in SESSION_TEXT_FIELDS and isinstance(v, str):
+            v = redact(v)
+        clean[k] = v
+    cols = ["source", "external_id", *clean]
+    updates = ", ".join(f"{c}=excluded.{c}" for c in clean) or "source=excluded.source"
+    conn.execute(
+        f"INSERT INTO sessions ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))}) "
+        f"ON CONFLICT(source, external_id) DO UPDATE SET {updates}",
+        [source, str(external_id), *clean.values()],
+    )
+    return conn.execute("SELECT id FROM sessions WHERE source=? AND external_id=?",
+                        (source, str(external_id))).fetchone()[0]

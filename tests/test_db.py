@@ -18,7 +18,7 @@ def test_migrations_are_versioned_and_idempotent(tmp_path):
 
 def test_evidence_columns(conn):
     cols = [r[1] for r in conn.execute("PRAGMA table_info(evidence)")]
-    assert cols == ["id", "project_id", "source", "kind", "url_or_path", "snippet", "created_at"]
+    assert cols == ["id", "project_id", "source", "kind", "url_or_path", "snippet", "created_at", "session_id"]
 
 
 def test_upserts_do_not_duplicate(conn):
