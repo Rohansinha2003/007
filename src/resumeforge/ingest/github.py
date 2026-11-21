@@ -251,6 +251,11 @@ def ingest(conn, gh: GitHubClient, user: str, on_repo: Callable[[str], None] = l
         import_repo(conn, gh, user, r)
     db.set_setting(conn, "github_username", user)
     db.set_setting(conn, "github_last_ingest_at", db.now())
+    try:  # public profile, for the resume header
+        u = gh.get(f"/users/{user}").json()
+        db.set_setting(conn, "github_profile", {k: u.get(k) for k in ("login", "name", "html_url", "blog", "location")})
+    except NotFound:
+        pass
     conn.commit()
     return {"repos_seen": len(repos), "imported": len(own), "forks_skipped": len(repos) - len(own),
             "api_calls": gh.calls}

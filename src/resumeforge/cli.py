@@ -9,7 +9,7 @@ import typer
 
 import sys
 
-from . import db, evaluator as ev, extract as ex, llm as llm_mod, market as mk
+from . import db, evaluator as ev, extract as ex, generate as gen, llm as llm_mod, market as mk, render
 from .skills import canonical, key as skill_key
 from .ingest import antigravity, claude_code, codex, common, exports, github
 
@@ -246,7 +246,7 @@ def evaluate(
     ctx: typer.Context,
     judge: str = typer.Option("auto", help="Depth judge: auto, llm or heuristic"),
     rubric: Path = typer.Option(None, help="Rubric YAML (default: the packaged rubric.yaml)"),
-    show: str = typer.Option("all", help="all, projects or skills"),
+    show: str = typer.Option("all", help="all, projects, skills or none (counts only)"),
     as_json: bool = typer.Option(False, "--json"),
     width: int = typer.Option(70, help="Reason column width"),
     role: str = typer.Option(None, help="Target role for the demand criterion (default: last used, or the only role)"),
@@ -551,6 +551,157 @@ def gap(
     for x in g["unused"][:top]:
         typer.echo(f"  {x['skill'][:24]:<24} {x['projects']:>8} {x['evidence']:>8}  {','.join(x['kinds'])[:20]:<20} "
                    f"{x['evaluation'] or '-'}")
+
+
+def _has_key() -> bool:
+    return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+
+
+def _pick(kind: str, value: str, choices: tuple[str, ...]) -> str:
+    """Resolve auto/llm/<offline> for a pipeline stage."""
+    if value not in ("auto", "llm", *choices):
+        typer.echo(f"error: --{kind} must be auto, llm or {' or '.join(choices)}", err=True)
+        raise typer.Exit(1)
+    if value == "llm" and not _has_key():
+        typer.echo(f"error: --{kind} llm needs ANTHROPIC_API_KEY", err=True)
+        raise typer.Exit(1)
+    if value == "auto":
+        return "llm" if _has_key() else choices[0]
+    return value
+
+
+def _read_jd(jd: str) -> str:
+    if jd == "-":
+        return sys.stdin.read()
+    path = Path(jd).expanduser()
+    if not path.is_file():
+        typer.echo(f"error: job description {jd} not found", err=True)
+        raise typer.Exit(1)
+    return path.read_text(errors="replace")
+
+
+@app.command()
+def generate(
+    ctx: typer.Context,
+    jd: str = typer.Option(..., "--jd", help="Job description file, or '-' for stdin"),
+    out: Path = typer.Option(Path("resume.docx"), "--out", help="DOCX path; the PDF and evidence.md go next to it"),
+    pdf: bool = typer.Option(True, "--pdf/--no-pdf", help="Also write a PDF"),
+    evidence: Path = typer.Option(None, help="Evidence file (default: evidence.md next to --out)"),
+    n_projects: int = typer.Option(4, "--projects", help="Projects on the resume"),
+    n_skills: int = typer.Option(16, "--skills", help="Skills on the resume"),
+    bullets: int = typer.Option(4, help="Max bullets per project"),
+    writer: str = typer.Option("auto", help="Bullet writer: auto, llm or template"),
+    checker: str = typer.Option("auto", help="Claim check: auto, llm, lexical or both"),
+    strict: bool = typer.Option(False, "--strict", help="Remove flagged bullets too, not only unsupported ones"),
+    hidden_ids: bool = typer.Option(True, "--hidden-ids/--no-hidden-ids", help="Hidden evidence ids in the DOCX"),
+    name: str = typer.Option(None, help="Your name (saved for next time)"),
+    email: str = typer.Option(None, help="Contact email (saved, stays local)"),
+    phone: str = typer.Option(None, help="Phone (saved, stays local)"),
+    location: str = typer.Option(None, help="Location (saved)"),
+    link: list[str] = typer.Option(None, "--link", help="Links for the header, repeatable (saved)"),
+):
+    """Write a resume tailored to a job description, check every bullet against its evidence, and export it."""
+    conn = db.connect(ctx.obj["db"])
+    jd_text = _read_jd(jd)
+    if not jd_text.strip():
+        typer.echo("error: job description is empty", err=True)
+        raise typer.Exit(1)
+    if not conn.execute("SELECT 1 FROM projects LIMIT 1").fetchone():
+        typer.echo("error: no projects. Run: resume ingest github <username>", err=True)
+        raise typer.Exit(1)
+    rb = ev.load_rubric()
+    if not conn.execute("SELECT 1 FROM evaluations LIMIT 1").fetchone():
+        typer.echo("No evaluations yet: running `resume evaluate` first.", err=True)
+        try:
+            role = mk.resolve_role(conn, _saved_role(conn))
+        except mk.MarketError:
+            role = None
+        ev.evaluate(conn, ev.LLMJudge(llm_mod.LLM(conn)) if _has_key() else ev.HeuristicJudge(), rb, role=role)
+    w = _pick("writer", writer, ("template",))
+    if checker not in ("auto", "llm", "lexical", "both"):
+        typer.echo("error: --checker must be auto, llm, lexical or both", err=True)
+        raise typer.Exit(1)
+    if checker in ("llm", "both") and not _has_key():
+        typer.echo(f"error: --checker {checker} needs ANTHROPIC_API_KEY", err=True)
+        raise typer.Exit(1)
+    if checker == "auto":  # with a key: the cheap exact check, then the second LLM pass
+        checker = "both" if _has_key() else "lexical"
+    if not _has_key():
+        typer.echo("No ANTHROPIC_API_KEY: template bullets and the lexical claim check are used.", err=True)
+    client = llm_mod.LLM(conn) if _has_key() else None
+    checkers = {"lexical": lambda: [gen.LexicalChecker()], "llm": lambda: [gen.LLMChecker(client)],
+                "both": lambda: [gen.LexicalChecker(), gen.LLMChecker(client)]}[checker]()
+    profile = {k: v for k, v in {"name": name, "email": email, "phone": phone, "location": location,
+                                 "links": list(link) if link else None}.items() if v}
+    if profile:
+        db.set_setting(conn, "profile", {**(db.get_setting(conn, "profile") or {}), **profile})
+        conn.commit()
+
+    def show(p):
+        kept = len(p.kept)
+        typer.echo(f"  {p.name[:30]:<30} {p.decision:<8} score {p.score:.2f}  fit {p.fit:.2f}  "
+                   f"bullets {kept} kept, {len(p.bullets) - kept} removed")
+
+    typer.echo("Selected projects:")
+    resume = gen.build(
+        conn, jd_text, writer=gen.LLMWriter(client) if w == "llm" else gen.TemplateWriter(), checkers=checkers,
+        extractor=mk.LLMExtractor(client) if client else mk.KeywordExtractor(), rubric=rb,
+        header=gen.header(conn), n_projects=n_projects, n_skills=n_skills, max_bullets=bullets, strict=strict,
+        on_project=show)
+    if not resume.projects:
+        typer.echo("error: no project has a supported bullet; nothing to write. Check `resume evaluate`.", err=True)
+        raise typer.Exit(1)
+    removed = resume.removed()
+    if removed:
+        typer.echo("\nClaim check: removed or flagged bullets")
+        for pname, b in removed:
+            typer.echo(f"  {b.status.upper():<8} {pname}: {b.text[:90]}")
+            typer.echo(f"           why ({b.checker}): {b.reason}")
+    else:
+        typer.echo("\nClaim check: every bullet is supported by its cited evidence.")
+    matched = [x["skill"] for x in resume.jd_skills if x["have"]]
+    missing = [x["skill"] for x in resume.jd_skills if not x["have"]]
+    typer.echo(f"\nJD skills you have evidence for: {', '.join(matched) or 'none'}")
+    typer.echo(f"JD skills not claimed (no evidence): {', '.join(missing) or 'none'}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    written = [render.to_docx(resume, out, hidden_ids=hidden_ids)]
+    if pdf:
+        written.append(render.to_pdf(resume, out.with_suffix(".pdf")))
+    written.append(render.to_evidence_md(resume, conn, evidence or out.with_name("evidence.md")))
+    typer.echo("\nWrote " + ", ".join(str(p) for p in written))
+
+
+@app.command("run-all")
+def run_all(
+    ctx: typer.Context,
+    github_user: str = typer.Option(..., "--github", help="GitHub username"),
+    jd: str = typer.Option(..., "--jd", help="Job description file"),
+    out: Path = typer.Option(Path("out/resume.docx"), "--out", help="DOCX path; PDF and evidence.md go next to it"),
+    logs: bool = typer.Option(True, "--logs/--no-logs", help="Import AI coding sessions from this machine"),
+    role: str = typer.Option(None, help="Market role for the evaluator's demand criterion"),
+    strict: bool = typer.Option(False, "--strict", help="Remove flagged bullets too"),
+):
+    """Full pipeline: ingest GitHub (and local AI logs), extract, evaluate, generate."""
+    def step(t):
+        typer.echo(f"\n== {t}")
+
+    step(f"1/5 GitHub: {github_user}")
+    ingest_github(ctx, github_user)
+    step("2/5 AI coding sessions")
+    if logs:
+        ingest_logs(ctx, claude_code.DEFAULT_ROOT, codex.DEFAULT_ROOT, antigravity.DEFAULT_ROOT)
+    else:
+        typer.echo("skipped (--no-logs)")
+    step("3/5 Extraction")
+    if _has_key():
+        extract(ctx, project=None, limit=0, min_evidence=2, dry_run=False, no_cache=False, show_prompt=False)
+    else:
+        typer.echo("skipped: no ANTHROPIC_API_KEY (skills come from GitHub languages only)")
+    step("4/5 Evaluation")
+    evaluate(ctx, judge="auto", rubric=None, show="none", as_json=False, width=70, role=role)
+    step("5/5 Resume")
+    generate(ctx, jd=jd, out=out, pdf=True, evidence=None, n_projects=4, n_skills=16, bullets=4, writer="auto",
+             checker="auto", strict=strict, hidden_ids=True, name=None, email=None, phone=None, location=None, link=None)
 
 
 @app.command()

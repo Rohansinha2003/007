@@ -53,6 +53,9 @@ class FakeGitHub:
             if page == 1:  # two pages to exercise pagination
                 return ok(self.repos[:3], {"link": f'<{API}{path}?page=2>; rel="next"'})
             return ok(self.repos[3:])
+        if path == f"/users/{USER}":
+            return ok({"login": USER, "name": "Dev Example", "html_url": f"https://github.com/{USER}",
+                       "blog": "https://dev.example", "location": "Remote"})
         name = parts[2] if len(parts) > 2 else None
         tail = "/".join(parts[3:])
         if tail == "languages":

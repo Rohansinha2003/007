@@ -1,231 +1,274 @@
-# Evidence-based resume builder
+# resumeforge: an evidence-based resume builder
 
-Reads a developer's real work history, stores every fact as an evidence row, and (in later steps)
-builds a resume where each claim links to that evidence. Project rules live in `CLAUDE.md`.
+resumeforge reads your real work history and turns it into a resume where every claim links to evidence. The history comes from three places:
+- your GitHub repos;
+- the AI coding sessions on your machine;
+- your ChatGPT and Claude.ai exports.
 
-## Quick start
+It also scores what deserves a place on the resume, measures demand from job postings you collect, and writes a tailored resume. That resume comes as DOCX and PDF, along with an `evidence.md` file you can use to check every bullet.
+
+**The rule throughout: no evidence, no claim.** Every skill and every bullet points to rows in the `evidence` table. A claim without valid evidence is dropped and reported, never written.
 
 ```bash
-uv sync
-export GITHUB_TOKEN=...            # optional; e.g. GITHUB_TOKEN=$(gh auth token)
-uv run resume ingest github <username>
-uv run resume projects             # table; add --json for full rows
-uv run resume ingest logs          # Claude Code, Codex and Antigravity sessions on this machine
-uv run resume ingest export ~/Downloads/chatgpt-export.zip   # ChatGPT or Claude.ai export
-uv run resume sessions --stats     # counts per source
-uv run resume sessions             # recent sessions with their linked project
-uv run resume extract --dry-run    # build prompts, estimate tokens and cost, no API calls
-export ANTHROPIC_API_KEY=...
-uv run resume extract              # LLM facts per project (cached; re-runs are free)
-uv run resume skills               # each skill with its count of projects and evidence
-uv run resume llm-usage            # tokens and cost from the call log
-uv run resume evaluate             # keep / rewrite / drop for every project and skill
-uv run resume explain p7           # full score breakdown for one item
-uv run resume override p7 drop     # your decision wins over every later evaluate run
-uv run resume override p7 --clear
-uv run resume market add postings.csv --role "ai engineer"   # also a .txt/.md file, a folder, or '-' for stdin
-uv run resume market demand        # share of postings per skill, required vs nice-to-have
-uv run resume gap --role "ai engineer"
-uv run resume evaluate --role "ai engineer"   # demand becomes a weighted criterion
+uv run resume run-all --github <username> --jd job.txt
+# -> out/resume.docx, out/resume.pdf, out/evidence.md
 ```
 
-The database is `resume.db` in the current folder. Override with `--db PATH` or `RESUME_DB`.
+## Contents
 
-## What works
+- [Install](#install)
+- [Setup](#setup)
+- [The pipeline in one command](#the-pipeline-in-one-command)
+- [Commands](#commands)
+- [How decisions are made](#how-decisions-are-made)
+- [Data privacy](#data-privacy)
+- [Known limitations](#known-limitations)
+- [Development](#development)
+- [What to build next](#what-to-build-next)
 
-- **`resume ingest github <username>`** imports every non-fork public repo through the GitHub REST API.
-  Per repo it stores description, languages, README text, topics, stars, commit count by the user,
-  first and last commit dates, and deployment status. It writes one project row plus evidence rows.
-- **`resume projects`** lists imported projects, newest commit first.
-- **Re-running is safe.** Projects upsert on the GitHub repo id. Evidence upserts on source, kind and URL.
-  Evidence a repo no longer has, such as a deleted README, is removed on the next run.
-- **Rate limits.** The importer waits for the reset time on a primary rate limit and honors `retry-after`
-  on secondary limits. Waits longer than 15 minutes stop the run with a clear message; finished repos stay saved.
-  Server errors and network failures retry with backoff.
-- **Redaction.** Every text field written to the database passes through `redact.py` first: evidence snippets,
-  session titles and summaries, and project text fields. It removes vendor API keys and tokens (Anthropic, OpenAI,
-  GitHub, GitLab, AWS, Google, Hugging Face, npm, Slack, Stripe, SendGrid, Twilio), JWTs, private keys,
-  `Authorization` headers, secret and password assignments, `--password` flags, URLs with embedded credentials,
-  secret query parameters on signed URLs, private-network URLs (localhost, 10.x, 192.168.x, `.internal`, ...)
-  and emails. The LLM wrapper redacts again before any request.
-- **Skills from languages.** Each language GitHub reports is recorded in `skills_observed` against the
-  languages evidence row. A skill cannot be recorded without an existing evidence row.
+## Install
 
-- **`resume ingest logs`** imports AI coding sessions from Claude Code, Codex and Google Antigravity.
-  Per session it stores the tool, dates, project folder, user messages, assistant summaries and files touched.
-  Each message becomes an evidence row. Sessions are linked to GitHub projects by git remote, folder name,
-  or a repo URL in the messages. Formats and paths are documented in `docs/sources.md`.
-- **`resume ingest export <file>`** imports a ChatGPT or Claude.ai data export, as the `.zip` or its
-  `conversations.json`. The format is detected automatically. These parsers are tested with small fake files only,
-  because no real export was available.
-- **`resume sessions --stats`** shows counts per source: sessions, linked sessions, user and assistant messages,
-  evidence rows, and rows with redactions.
+You need Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
-- **`resume extract`** sends each project's redacted README, commit stats, deployment, languages and linked
-  session evidence to the LLM. The reply must match a JSON schema with a summary, technologies, skills, an outcome
-  (shipped, prototype or abandoned) and an authorship estimate (self_written, ai_assisted, mostly_ai or unknown)
-  with a reason. Every technology, skill, outcome and authorship claim carries evidence ids.
-- **No evidence, no claim.** A claim is rejected unless it cites at least one evidence id that was in the prompt
-  for that project. Invalid ids are dropped from otherwise supported claims. An unsupported outcome becomes empty,
-  and an unsupported authorship becomes `unknown`. Rejected claims are kept in `project_facts.rejected` for review.
-  Accepted technologies and skills go into `skills_observed`.
-- **Authorship needs logs.** The model is told that missing session logs are not proof of self-written code, so
-  projects without linked sessions should come back `unknown`. `unknown` is a fourth value beyond the three requested.
-- **Skill names are normalized** through the alias table in `skills.py`, so React.js, ReactJS and React are one skill.
-- **`resume skills`** lists each skill with its number of projects and evidence rows, filterable by kind
-  (`language` from GitHub, `technology` and `skill` from extraction).
+```bash
+git clone <this repo> && cd resumeforge
+uv sync                 # creates .venv and installs dependencies
+uv run resume --help
+```
 
-LLM wrapper (`llm.py`):
-- Sends the pydantic model's JSON schema as the required output format and validates the reply against it.
-- Retries invalid JSON up to three attempts, telling the model what was wrong, and doubles `max_tokens` after a truncated reply.
-  The Anthropic SDK retries rate limits, server errors and connection failures with backoff.
-- Caches validated results in `llm_cache` by a SHA-256 hash of model, prompt and schema.
-- Logs every call, cache hits and failures included, in `llm_calls` with tokens and cost.
-  Prices are a dated snapshot in `PRICES`. Default model is `claude-opus-5-5` with server-side refusal fallback.
+The dependencies are anthropic, typer, pydantic, pyyaml, python-docx and fpdf2, plus pytest for development. Everything is stored in a single SQLite file.
 
-Not verified yet: no API key was available while building this stage, so live extraction has not run.
-Tests mock the model. A run on a copy of the real database with a stand-in model covered all 53 projects and
-confirmed that unsupported claims are rejected. The dry run estimates about $2 for all projects.
+## Setup
 
-### Evaluator
+| Setting | Needed for | Default |
+|---|---|---|
+| `GITHUB_TOKEN` | Optional. Raises the GitHub limit from 60 to 5000 requests per hour. A full import of 60 repos takes about 320 requests. | none. Tip: `GITHUB_TOKEN=$(gh auth token) uv run resume ...` |
+| `ANTHROPIC_API_KEY` | The LLM stages: extraction, the depth judge, posting and job-description skills, bullet writing and the claim check. Without it every stage falls back to an offline method; see below. | none |
+| `RESUME_DB` or `--db PATH` | Where the database lives | `./resume.db` |
+| `RESUMEFORGE_MODEL` | Model for LLM calls | `claude-opus-5-5` |
 
-`resume evaluate` scores every project and skill against `src/resumeforge/rubric.yaml` and prints a table
-with the score breakdown, a decision and a reason. Pass `--rubric my.yaml` to use your own weights and thresholds.
-Weights in each group are normalized to sum to 1, and the rubric hash is stored with each evaluation.
+What happens without an API key:
 
-| Projects | How the 0 to 1 value is computed |
+| Stage | With a key | Without a key |
+|---|---|---|
+| Extraction (`resume extract`) | Summary, technologies, skills, outcome and authorship, each cited | Skipped. Skills come only from GitHub language stats. |
+| Depth judge (`resume evaluate`) | LLM rates depth and complexity, with a one-line reason | Heuristic from README size, commits, files edited, sessions, deployment and code size |
+| Skills in postings and the job description | LLM, with an exact quote required for each skill | Keyword matching on the alias table |
+| Bullets (`resume generate`) | LLM writes action + result bullets citing evidence ids | Template bullets filled from evidence rows |
+| Claim check | An exact lexical check, then a second LLM pass | The lexical check only |
+
+## The pipeline in one command
+
+```bash
+uv run resume run-all --github <username> --jd job.txt [--out out/resume.docx] [--no-logs] [--role "ai engineer"] [--strict]
+```
+
+1. **GitHub.** Imports your public non-fork repos. Re-runs are safe.
+2. **AI coding sessions.** Imports Claude Code, Codex and Antigravity sessions found on this machine. Skip this with `--no-logs`.
+3. **Extraction.** Runs only with an API key.
+4. **Evaluation.** Gives each project and skill a decision: keep, rewrite or drop. Uses the market role if you have postings on file.
+5. **Generation.** Picks projects and skills, writes bullets, checks every bullet against its cited evidence, and writes:
+   - `resume.docx`;
+   - `resume.pdf`;
+   - `evidence.md`, which lists each bullet with its source links.
+
+Each step is also a separate command, described below.
+
+## Commands
+
+### Import
+
+| Command | What it does |
 |---|---|
-| depth | Judged depth and complexity, each 1 to 5, averaged and scaled |
-| originality | Extracted authorship mapped through the rubric. Without extraction it is `unknown` and scores 0.5 |
-| evidence | Log-scaled evidence row count, mixed with how many kinds of evidence exist |
-| shipped | Extracted outcome. Without extraction, a GitHub deployment counts as shipped |
-| recency | Half-life decay from the last commit or session |
-| demand | Share of the role's top-3 skill demand covered by the project's top-3 skills. Only used with `--role` and postings on file |
+| `resume ingest github <user>` | Imports each non-fork public repo, storing the fields below. Handles rate limits and pagination. Safe to re-run. |
+| `resume ingest logs` | Imports AI coding sessions with their user messages, assistant summaries and files touched, and links each session to a GitHub project. Override the default paths with `--claude-root`, `--codex-root` and `--antigravity-root`. |
+| `resume ingest export <file>` | Imports a ChatGPT or Claude.ai data export, given as the `.zip` or its `conversations.json`. The format is detected automatically. |
+| `resume projects` | Lists imported projects. Add `--json` for full rows. |
+| `resume sessions [--stats]` | Lists sessions, or shows counts per source. |
 
-| Skills | How the 0 to 1 value is computed |
+For each repo, the GitHub import stores:
+- description, languages, topics and stars;
+- README text;
+- the number of commits credited to you, and the first and last commit dates;
+- whether the repo has a deployment (homepage field, GitHub Pages or the Deployments API).
+
+Session formats and paths are documented in [docs/sources.md](docs/sources.md). Sessions are linked to projects by trying these in order:
+1. the git remote;
+2. the folder name;
+3. a GitHub URL mentioned in the conversation;
+4. for chats only, the repo name in the title.
+
+### Extract
+
+| Command | What it does |
 |---|---|
-| breadth | Number of kept projects that use it, saturating at 4 |
-| depth | For languages, the byte share in the projects that use it. For extracted skills, evidence rows per project |
-| recency | Half-life decay from the newest evidence |
-| evidence | Log-scaled evidence row count |
-| demand | The skill's demand score for the role. Only used with `--role` and postings on file |
+| `resume extract [--dry-run] [--project NAME] [--limit N]` | Sends each project's redacted evidence to the LLM. Gets back a summary, technologies, skills, an outcome and an authorship estimate, each with evidence ids. `--dry-run` estimates tokens and cost without calling the API. |
+| `resume skills [--kind language\|technology\|skill]` | Lists each skill with its number of projects and evidence rows. |
+| `resume llm-usage` | Shows tokens and cost per purpose, from the LLM call log. |
 
-Decisions:
-- A score at or above `keep` means keep, at or above `rewrite` means rewrite, and anything lower means drop.
-- **Rules apply after the score.** The profile README repo and repos with no commits by you and no linked AI session are dropped.
-  A skill that is only a trace in every project, like 0.3% Shell, is capped at rewrite.
-- **Skills only count kept projects.** A skill used only in dropped projects is dropped.
-- **No evidence, no claim.** A skill claimed during extraction without valid evidence gets no score.
-  It is `needs_evidence` if it was claimed at least twice, otherwise `drop`, and it cannot be overridden to keep.
-- **Overrides** live in their own table, which only `resume override` writes. Evaluation runs never change them.
-  The table marks overridden rows with `*`.
+A claim is rejected unless it cites an evidence id that was in that project's prompt. Rejected claims are kept for review in `project_facts.rejected`. Skill names are normalized through the alias table in `skills.py`, so React.js, ReactJS and React are one skill.
 
-Judges:
-- The LLM only rates depth and complexity and writes the one-line reason. Every other criterion is computed in code.
-- With `ANTHROPIC_API_KEY` set, `--judge auto` uses the LLM judge. It returns validated JSON, results are cached,
-  and a judgment with no valid evidence id is discarded in favor of the heuristic judge.
-- Without a key, the deterministic heuristic judge rates depth from README size, commits, files edited,
-  sessions, deployment, code size and language count.
-- To replace the LLM with a small local model, implement the `Judge` protocol in `evaluator.py` and pass it to
-  `evaluate()`. The protocol is a `name` plus `judge(ProjectInput) -> Judgment`.
+### Evaluate
 
-On the real data, so far only with the heuristic judge: 12 projects keep, 10 rewrite and 38 drop, and 8 skills keep.
-Known weak spot: a repo with a committed virtualenv inflates the heuristic's code-size signal (AI-Agent shows 49 MB in 12 languages).
+| Command | What it does |
+|---|---|
+| `resume evaluate [--role R] [--judge auto\|llm\|heuristic] [--rubric my.yaml]` | Scores every project and skill and prints keep, rewrite or drop, with per-criterion scores and a reason. |
+| `resume explain <id>` | Prints the full weighted sum and inputs for one item, such as `p7` or `s:python`. |
+| `resume override <id> keep\|drop [--note ...]` / `--clear` | Your decision. Overrides are stored separately and later runs never change them. Keep is refused for an item with no evidence. |
 
 ### Market demand
 
-There is no scraping. You collect postings yourself and add them under a role label.
+You collect postings yourself; nothing is scraped.
 
-- **`resume market add <source> --role <name>`** accepts a `.txt` or `.md` file (one posting), a CSV with the columns
-  `title, company, location, description`, a folder of those files, `-` to paste on stdin, or the posting text itself.
-  Postings are redacted and stored once per role: re-adding the same text is skipped. Role labels are lowercased.
-- **Skill extraction.** With `ANTHROPIC_API_KEY`, the LLM returns validated JSON: each skill with `required` or
-  `preferred` and the exact words from the posting. A skill whose quote is not in the posting is rejected and kept in
-  `postings.rejected`. Without a key, or if a call fails, a keyword extractor uses the alias table. It reads
-  required versus preferred from section headings such as "Requirements" and "Nice to have" and from cues such as
-  "is a plus". Ambiguous words like Go, REST, React and Express only count with that capitalization. Names go
-  through the same alias table as extraction, so `ReactJS` in a posting matches `React` in your history.
-  `resume market extract --force --extractor llm` re-extracts with the LLM later.
-- **`resume market demand`** shows each skill's share of the role's postings, its required and preferred counts, a
-  flag (`required` if at least half of the postings that mention it require it, else `nice-to-have`), and a demand score:
-  `(required + 0.5 x preferred) / postings`. The weights are in the `market` section of the rubric.
-- **`resume gap --role <name>`** prints three lists:
-  - (a) in-demand skills you have evidence for, with project and evidence counts and the current evaluation;
-  - (b) in-demand skills with no evidence, noting any that extraction claimed without valid evidence;
-  - (c) skills you have evidence for that no posting asks for.
-
-  It also prints how much of the role's total demand your evidence covers.
-- **Demand in the evaluator.** `resume evaluate --role <name>` adds a `demand` criterion, with weight 0.25 before normalization in both groups:
-  - **Skills:** the skill's demand score.
-  - **Projects:** the summed demand of the project's top 3 skills, divided by the summed demand of the role's top 3 skills.
-    Languages under 5% of a project's code are ignored.
-
-  The role is remembered for later runs. With no postings on file, the criterion is left out and the other
-  weights are rescaled, so scores match what they were before this step.
-- `resume market list` and `resume market remove` manage stored postings. `tests/data/postings_ai_engineer.csv` holds
-  10 fake postings for trying the feature offline.
-
-Tried on a copy of the real database with the 10 fake postings, keyword extraction and the heuristic judge:
-- Your evidence covers 27% of the role's demand. Python, Docker, PostgreSQL, TypeScript and C++ are in demand and backed.
-  LLM APIs, RAG and AWS are the top gaps, mostly because extraction has not run, so only languages count as evidence.
-- Projects went from 12 keep, 10 rewrite and 38 drop to 8 keep, 11 rewrite and 41 drop.
-  Chest_X_ray moved up from drop to rewrite on Python and Docker demand.
-  four-pillars, finance-buddy and ResearchOS moved down from keep to rewrite, because their TypeScript stack has little demand for this role.
-- HTML and Jupyter Notebook dropped from keep to rewrite, because no posting asks for them.
-
-The real database has no postings yet. The fake ones are test data only.
-
-Known limits for market demand:
-- The keyword extractor only knows skills in the alias table. The LLM extractor is not limited this way, but it has not run live.
-- There is no skill hierarchy, so a posting asking for "Machine learning" is not matched by evidence for PyTorch.
-
-How GitHub facts are derived:
-
-| Field | Source |
+| Command | What it does |
 |---|---|
-| Commit count, first and last dates | Commits on the default branch where GitHub credits the user as author. Empty repos count 0. |
-| Deployment | The homepage field if it is not a GitHub link, then GitHub Pages, then the Deployments API (for example Vercel). |
-| README | First 8000 characters of the raw README. |
+| `resume market add <source> --role "ai engineer"` | Adds postings from a `.txt` or `.md` file, a CSV (`title, company, location, description`), a folder, `-` for stdin, or pasted text. Postings are redacted and stored once per role. |
+| `resume market extract [--role R] [--force] [--extractor llm]` | Re-extracts required and preferred skills, for example with the LLM once you have a key. |
+| `resume market demand [--role R]` | Per skill: share of postings, required versus nice-to-have counts, and a demand score. |
+| `resume market list` / `remove` | Manages stored postings. |
+| `resume gap --role R` | Prints three lists: (a) in-demand skills you have evidence for, (b) in-demand skills without evidence, (c) skills you have that nobody asks for. Also prints how much of the role's demand you cover. |
 
-Known limits for sessions:
-- Cursor chats and Gemini CLI are not imported. Cursor stores chats in a binary database, and Gemini CLI data was not on the dev machine.
-- Antigravity and Codex sessions have no files-touched list. See `docs/sources.md` for why.
-- User messages are capped at 4000 characters and assistant text at 2000.
+For each posting, a skill is extracted only with a quote from the posting text. The demand score is `(required + 0.5 x preferred) / number of postings`. A sample CSV with 10 fake postings is in `tests/data/postings_ai_engineer.csv`.
 
-Known limits for GitHub:
-- Only public repos are imported.
-- Commits made under an email that is not linked to the account are not counted.
-- Branches other than the default are not counted.
-
-## Schema
-
-Migrations are SQL scripts in `src/resumeforge/db.py`, applied in order and tracked with `PRAGMA user_version`.
-To change the schema, append a new script. Never edit an applied one.
-
-| Table | Purpose |
-|---|---|
-| `projects` | One row per repo, unique on source plus external id |
-| `evidence` | `id, project_id, source, kind, url_or_path, snippet, created_at`, plus `session_id` for session evidence |
-| `skills_observed` | `skill, project_id, evidence_id, kind, origin`; the evidence id is required |
-| `sessions` | One row per AI-tool session or chat: tool, kind, dates, project path, linked project and how it was linked, message counts, files touched, last summary |
-| `settings` | Key-value JSON, such as the GitHub username and the last ingest time |
-| `project_facts` | One row per extracted project: summary, outcome, authorship, validated JSON, rejected claims |
-| `llm_cache` | Validated LLM results keyed by input hash |
-| `llm_calls` | One row per LLM call: purpose, model, cached, attempts, tokens, cost, error |
-| `evaluations` | Latest computed score, decision, breakdown and reason per item (`p<id>` or `s:<skill>`) |
-| `overrides` | Your keep or drop decisions. Written only by `resume override` |
-| `postings` | Job postings you added: role label, title, company, location, redacted text, content hash, extractor, rejected skills |
-| `posting_skills` | Skills per posting: canonical name and key, `required` or `preferred`, and the quote that shows it |
-
-## Other modules
-
-- `redact.py` removes API keys, tokens, JWTs, database URLs with passwords, private keys, secret assignments and emails.
-
-## Tests
+### Generate
 
 ```bash
-uv run pytest
+uv run resume generate --jd job.txt --out out/resume.docx \
+    --name "Your Name" --email you@example.com --phone "..." --link https://your.site
 ```
 
-GitHub tests use a fake HTTP transport. Log and export tests use small fake files in `tests/fixtures.py`
-that copy the record shapes of the real logs. Market tests use `tests/data/postings_ai_engineer.csv`. All secrets in tests are fake. No network access is needed.
+| Option | Default | Meaning |
+|---|---|---|
+| `--jd FILE` or `-` | required | The job description |
+| `--out` | `resume.docx` | DOCX path. The PDF and `evidence.md` are written next to it. |
+| `--projects` / `--skills` / `--bullets` | 4 / 16 / 4 | How many projects and skills to include, and the bullet limit per project |
+| `--writer auto\|llm\|template` | auto | Who writes the bullets |
+| `--checker auto\|llm\|lexical\|both` | auto | `auto` means both checkers with a key and lexical without one |
+| `--strict` | off | Also remove flagged bullets, not only unsupported ones |
+| `--no-pdf`, `--no-hidden-ids` | | Skip the PDF, or leave hidden ids out of the DOCX |
+| `--name --email --phone --location --link` | GitHub profile | Header fields. They are saved locally for the next run. |
+
+How it works:
+1. **Read the job description.** Its required and preferred skills are extracted the same way as postings.
+2. **Select.** Projects with an effective decision of keep or rewrite (your overrides win) are ranked by
+   `0.6 x evaluator score + 0.4 x fit + 0.1 if keep`. Fit is the share of the job's top-3 skill demand covered by the project's skills.
+   Skills come from keep decisions, plus rewrite decisions the job asks for. Each needs at least one evidence row.
+3. **Write bullets.** Bullets follow the form action + what + how + result, and each cites evidence ids. A bullet citing no evidence of its own project is removed.
+4. **Check claims.** The lexical checker requires every number, URL and known technology in a bullet to appear in that bullet's cited evidence. The LLM checker then reads only the cited evidence and returns one of:
+   - `supported`: kept;
+   - `partial`: flagged, and removed with `--strict`;
+   - `unsupported`: removed.
+
+   Every removed or flagged bullet is printed with the reason, and listed in `evidence.md`.
+5. **Export.**
+   - **DOCX and PDF:** a single column with standard section headings (SKILLS, PROJECTS), plain bullets, and no tables, images, text boxes or headers.
+   - **Hidden evidence ids in the DOCX:** each bullet carries its ids as a hidden run, `[evidence: E12 E40]`. Word doesn't show or print hidden text; turn on Hidden text in Word to see it. The PDF has no ids.
+   - **`evidence.md`:** each bullet with its check result, and each cited row's kind, date, link and snippet. It also lists the job's skills you couldn't claim, and the removed bullets.
+
+The resume covers projects and skills only, because that is what the evidence shows. Add work experience and education by hand in the DOCX.
+
+## How decisions are made
+
+`src/resumeforge/rubric.yaml` holds every weight, threshold and rule. Pass `--rubric my.yaml` to use your own. Weights are normalized per group, and the rubric's hash is stored with each evaluation.
+
+| Projects | 0 to 1 value |
+|---|---|
+| depth | Judged depth and complexity (LLM or heuristic), each 1 to 5, scaled |
+| originality | Extracted authorship: self_written 1.0, ai_assisted 0.7, mostly_ai 0.35, unknown 0.5 |
+| evidence | Log-scaled number of evidence rows, mixed with how many kinds of evidence exist |
+| shipped | Extracted outcome. Without extraction, a GitHub deployment counts as shipped. |
+| recency | Half-life decay from the last commit or session (one year) |
+| demand | Share of the role's top-3 demand covered by the project's top-3 skills. Used only with postings on file. |
+
+| Skills | 0 to 1 value |
+|---|---|
+| breadth | Number of kept projects using the skill, saturating at 4 |
+| depth | Byte share for languages, evidence density for extracted skills |
+| recency, evidence | Same as for projects |
+| demand | The skill's demand score for the role. Used only with postings on file. |
+
+Score bands: keep at 0.55 or above for projects (0.50 for skills), rewrite at 0.40 or above (0.30), drop below that.
+
+Rules applied after scoring:
+- **Projects dropped regardless of score:** the profile README repo, and repos with no commits by you and no linked AI session.
+- **Trace skills:** a skill that makes up only a trace of every project it appears in is capped at rewrite.
+- **Skills follow projects:** a skill seen only in dropped projects is dropped.
+- **Claimed without evidence:** a skill extraction claimed but couldn't back is `needs_evidence` if it was claimed at least twice, otherwise `drop`. It can never be kept.
+
+To swap the LLM judge for a local model, implement the `Judge` protocol in `evaluator.py`: a `name` plus `judge(ProjectInput) -> Judgment`. Writers (`generate.Writer`), checkers (`generate.Checker`) and posting extractors (`market.Extractor`) follow the same pattern.
+
+## Data privacy
+
+- **Local first.** All data stays in the local SQLite file. The tool makes network requests in only two cases:
+  - the GitHub API, to read your public repos and profile;
+  - the Anthropic API, for the LLM stages, and only when `ANTHROPIC_API_KEY` is set.
+- **Redaction at ingestion.** Every text field passes through `redact.py` before it is written. That covers evidence snippets, session titles and summaries, project text and posting text. The redactor removes:
+  - vendor API keys and tokens: Anthropic, OpenAI, GitHub, GitLab, AWS, Google, Hugging Face, npm, Slack, Stripe, SendGrid and Twilio;
+  - JWTs, private keys and `Authorization` headers;
+  - secret and password assignments, and `--password` flags;
+  - URLs with credentials, and secret query parameters;
+  - private-network URLs such as localhost, 10.x and `.internal`;
+  - emails.
+- **Redaction again before every LLM call.** The LLM wrapper redacts its whole prompt again.
+- **What the LLM sees.** Only redacted evidence for one project at a time, the posting or job description text, and the bullets being checked. Your header fields (name, email, phone) are never sent; they are stored in the local `settings` table.
+- **Caching.** LLM results are cached in the database by input hash, so re-runs make no new calls. Every call is logged with its token count and cost in `llm_calls`.
+- **Session paths in `evidence.md`.** It links to local session log paths. Review it before sharing.
+- **The GitHub token is never stored.**
+
+## Known limitations
+
+- **No API key on the development machine.** Extraction, the LLM judge, LLM bullets and the LLM claim check have been tested only with mocked responses. Every offline fallback has run on real data.
+- **Template bullets are plain.** They state what the evidence states: what was built, the stack, the deployment and the commit span. They contain no metrics and only the results the evidence states. LLM bullets read better, and the claim check keeps them honest.
+- **Projects only.** There is no employment history or education, because no source provides them.
+- **GitHub:** only public repos and the default branch are read, and only commits credited to your account are counted.
+- **Committed dependency folders inflate code size.** A committed virtualenv or `node_modules` inflates the heuristic's code-size signal and adds odd languages.
+- **Sessions:** Cursor and Gemini CLI are not imported. Antigravity and Codex sessions have no files-touched list. Long messages are truncated: user messages at 4000 characters, assistant text at 2000.
+- **Chat exports:** the parsers were built from documented formats and fake fixtures, not a real export.
+- **Keyword extraction** only knows skills in the alias table.
+- **No skill hierarchy:** "Machine learning" in a posting is not matched by PyTorch evidence.
+- **The lexical claim check is literal.** It catches invented numbers, links and technologies, but not reworded claims; the LLM pass covers those.
+- **The PDF uses a built-in font,** so characters outside Latin-1 are replaced with plain equivalents.
+
+## Development
+
+```bash
+uv run pytest          # 168 tests, no network
+```
+
+GitHub tests use a fake HTTP transport. Log and export tests use small fake files (`tests/fixtures.py`). LLM stages use fake backends. All secrets in the tests are fake.
+
+| Module | Role |
+|---|---|
+| `cli.py` | Typer CLI |
+| `db.py` | Schema migrations (`PRAGMA user_version`), upserts, redaction on write |
+| `redact.py` | Secret and PII patterns |
+| `llm.py` | The only LLM entry point: JSON-schema output, validation and retries, cache, cost log |
+| `ingest/` | GitHub, Claude Code, Codex, Antigravity, ChatGPT and Claude.ai export parsers |
+| `extract.py` | Evidence pack, then validated project facts |
+| `skills.py` | Alias table, used by every stage |
+| `evaluator.py` + `rubric.yaml` | Scores, decisions, overrides, `Judge` interface |
+| `market.py` | Postings, skill extraction, demand, gap |
+| `generate.py` | Selection, bullet writers, claim checkers |
+| `render.py` | DOCX, PDF and evidence.md |
+
+Schema (append a migration to change it; never edit an applied one):
+
+| Table | Holds |
+|---|---|
+| `projects` | One row per repo |
+| `evidence` | `id, project_id, source, kind, url_or_path, snippet, created_at, session_id`. Every claim points here. |
+| `skills_observed` | Skill, project, evidence id (required), kind, origin |
+| `sessions` | AI-tool sessions and chats: tool, dates, project link and how it was made, counts, files touched |
+| `project_facts` | Extracted facts plus rejected claims |
+| `evaluations` / `overrides` | The latest computed decisions, and your overrides |
+| `postings` / `posting_skills` | Job postings per role, and their skills with quotes |
+| `llm_cache` / `llm_calls` | Cached LLM results, and the call log |
+| `settings` | GitHub username and profile, the saved header, the target role |
+
+## What to build next
+
+1. **MCP connector.** Expose the evidence store and `generate` as an MCP server. An AI assistant could then answer "which projects show Kubernetes?" or tailor a resume mid-conversation, still citing evidence ids.
+2. **Browser extension.** One click on a job page saves the posting with `market add`, shows the gap report, and generates a tailored resume. This replaces copy and paste, and keeps the no-scraping rule because you choose each posting.
+3. **Web UI.** A local review screen with the resume on one side and the cited evidence on the other. You could accept, edit or override bullets and decisions there, instead of reading `evidence.md` and running `override`.
+4. **Live market data.** Pull postings from job board APIs that allow it, on a schedule, so demand scores stay current and show trends per role and region.
+5. **Local small model.** Implement the `Judge`, `Writer`, `Checker` and `Extractor` protocols on a small local model, for example through llama.cpp or Ollama, so the whole pipeline runs offline at no cost. The existing LLM results can serve as its evaluation set.
